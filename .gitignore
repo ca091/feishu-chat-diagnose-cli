@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+.pytest_cache/
+dist/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+config/config.toml
+config/*.local.toml
+
+# Runtime data and downloaded Feishu resources
+data/
+lark-im-resources/
+
+# Logs and local test/build artifacts
+*.log
+.coverage
+.ruff_cache/
+.mypy_cache/
+
+.idea

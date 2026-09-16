@@ -1,0 +1,24 @@
+[defaults]
+message_window = "2h"
+case_dir = "data/cases"
+max_messages = 300
+max_text_attachment_bytes = 1048576
+
+[feishu]
+lark_cli_bin = "lark-cli"
+
+[codex]
+bin = "codex"
+model = ""
+timeout_seconds = 600
+
+[video_tool]
+provider = "gemini"
+model = ""
+timeout_seconds = 300
+
+[repositories.example]
+path = "/absolute/path/to/project"
+description = "Example project"
+diagnosis_skill = "project-bugfix"
+allowed_skills = ["canvas-bugfix", "performance-diagnosis"]

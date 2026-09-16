@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feishu-chat-diagnose-cli"
+version = "0.1.0"
+description = "Manually diagnose Feishu conversations against a local repository"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "google-genai>=1,<2",
+  "mcp>=1,<2",
+  "pydantic>=2.10,<3",
+  "typer>=0.16,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9", "pytest-mock>=3.14,<4"]
+
+[project.scripts]
+feishu-diagnose = "feishu_chat_diagnose.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
