@@ -21,3 +21,4 @@ lark-im-resources/
 .mypy_cache/
 
 .idea
+.codegraph
