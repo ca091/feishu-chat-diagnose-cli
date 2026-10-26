@@ -30,6 +30,8 @@ allowed_skills = ["project-bugfix", "performance-optimization"]
 
 ### 全局配置与初始化
 
+唯一配置模板位于 [`src/feishu_chat_diagnose/config.example.toml`](src/feishu_chat_diagnose/config.example.toml)，随安装包分发；通过 `feishu-diagnose init` 生成实际配置。
+
 ```text
 ~/.feishu-diagnose/
 ├── config.toml

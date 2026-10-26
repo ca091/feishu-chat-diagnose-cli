@@ -1,6 +1,4 @@
 from concurrent.futures import ThreadPoolExecutor
-from importlib.resources import files
-from pathlib import Path
 import tomllib
 
 import pytest
@@ -150,11 +148,3 @@ def test_concurrent_init_publishes_one_complete_config(
     assert sum(result.status == "existing" for result in results) == 3
     assert load_settings().defaults.case_dir == diagnose_home / "cases"
     assert not list(diagnose_home.glob(".config-*"))
-
-
-def test_packaged_template_matches_repository_example() -> None:
-    packaged = files("feishu_chat_diagnose").joinpath("config.example.toml").read_text(
-        encoding="utf-8"
-    )
-    example = Path(__file__).parents[1] / "config/config.example.toml"
-    assert packaged == example.read_text(encoding="utf-8")
