@@ -1,3 +1,6 @@
+import pytest
+
+from feishu_chat_diagnose.conversation import ConversationAssembler
 from feishu_chat_diagnose.feishu import FeishuGateway, parse_message
 
 
@@ -155,6 +158,123 @@ def test_fetch_messages_follows_nested_data_pagination(fake_runner, time_range) 
 
     assert [item.message_id for item in messages] == ["om_first", "om_second"]
     assert fake_runner.calls[1][-2:] == ["--page-token", "nested-next"]
+
+
+def test_fetch_and_assemble_close_over_thread_quotes_and_connected_threads(fake_runner, time_range) -> None:
+    match = _raw_message("match", "Bug", "1752559260000") | {"root_id": "root_a"}
+    root_a = _raw_message("root_a", "First topic", "1752559200000")
+    sibling_a = _raw_message("sibling_a", "See related context", "1752559320000") | {
+        "root_id": "root_a", "parent_id": "linked",
+    }
+    linked = _raw_message("linked", "Related discussion", "1752559140000") | {
+        "root_id": "root_b", "parent_id": "ancestor",
+    }
+    ancestor = _raw_message("ancestor", "Earlier context", "1752559080000") | {"parent_id": "sibling_a"}
+    root_b = _raw_message("root_b", "Second topic", "1752559020000")
+    sibling_b = _raw_message("sibling_b", "More evidence", "1752559380000") | {
+        "root_id": "root_b", "parent_id": "external",
+    }
+    external = _raw_message("external", "Original evidence", "1752558960000")
+    fake_runner.responses.extend([
+        {"items": [match]},
+        {"items": [root_a], "has_more": True, "page_token": "next-thread-page"},
+        {"items": [sibling_a]},
+        {"items": [linked]},
+        {"items": [ancestor]},
+        {"items": [root_b, sibling_b]},
+        {"items": [external]},
+    ])
+    gateway = FeishuGateway(fake_runner)
+
+    messages = gateway.fetch_messages("oc_group_a", time_range)
+    selected = ConversationAssembler(max_messages=8).assemble(messages, keyword="bug")
+
+    assert {item.message_id for item in selected} == {
+        "match", "root_a", "sibling_a", "linked", "ancestor", "root_b", "sibling_b", "external",
+    }
+    assert gateway.last_missing_message_ids == []
+    assert [args[1] for args in fake_runner.calls] == [
+        "+chat-messages-list", "+threads-messages-list", "+threads-messages-list",
+        "+messages-mget", "+messages-mget", "+threads-messages-list", "+messages-mget",
+    ]
+    assert fake_runner.calls[2][-2:] == ["--page-token", "next-thread-page"]
+    assert not fake_runner.responses
+
+
+@pytest.mark.parametrize("parent_response", [{"items": []}, RuntimeError("permission denied")])
+def test_thread_sibling_missing_quote_is_reported_without_retry(mocker, time_range, parent_response) -> None:
+    match = _raw_message("match", "Bug", "1752559260000") | {"root_id": "root"}
+    sibling = _raw_message("sibling", "Related evidence", "1752559320000") | {
+        "root_id": "root", "parent_id": "unavailable",
+    }
+    runner = mocker.Mock()
+    runner.run.side_effect = [{"items": [match]}, {"items": [sibling]}, parent_response]
+    gateway = FeishuGateway(runner)
+
+    messages = gateway.fetch_messages("oc_group_a", time_range)
+    selected = ConversationAssembler(max_messages=2).assemble(messages, keyword="bug")
+
+    assert {item.message_id for item in selected} == {"match", "sibling"}
+    assert gateway.last_missing_message_ids == ["unavailable"]
+    assert runner.run.call_count == 3
+    assert runner.run.call_args.args[0][0:2] == ["im", "+messages-mget"]
+
+
+def test_partial_thread_failure_is_not_retried_after_new_quotes_are_fetched(mocker, time_range) -> None:
+    root = _raw_message("root", "Topic", "1752559200000")
+    match = _raw_message("match", "Bug", "1752559260000") | {"root_id": "root"}
+    sibling = _raw_message("sibling", "Evidence", "1752559320000") | {
+        "root_id": "root", "parent_id": "parent",
+    }
+    parent = _raw_message("parent", "Original evidence", "1752559140000")
+    runner = mocker.Mock()
+    runner.run.side_effect = [
+        {"items": [root, match]},
+        {"items": [sibling], "has_more": True, "page_token": "next"},
+        RuntimeError("thread unavailable"),
+        {"items": [parent]},
+    ]
+    gateway = FeishuGateway(runner)
+
+    messages = gateway.fetch_messages("oc_group_a", time_range)
+    selected = ConversationAssembler(max_messages=4).assemble(messages, keyword="bug")
+
+    assert {item.message_id for item in selected} == {"root", "match", "sibling", "parent"}
+    assert gateway.last_missing_message_ids == ["root"]
+    assert runner.run.call_count == 4
+
+
+def test_quote_obtained_from_thread_is_not_reported_as_missing(fake_runner, time_range) -> None:
+    match = _raw_message("match", "Bug", "1752559260000") | {"root_id": "root", "parent_id": "parent"}
+    parent = _raw_message("parent", "Original evidence", "1752559200000") | {"root_id": "root"}
+    fake_runner.responses.extend([
+        {"items": [match]}, {"items": []}, {"items": [parent]},
+    ])
+    gateway = FeishuGateway(fake_runner)
+
+    messages = gateway.fetch_messages("oc_group_a", time_range)
+
+    assert {item.message_id for item in messages} == {"match", "parent"}
+    assert gateway.last_missing_message_ids == []
+    assert len(fake_runner.calls) == 3
+
+
+def test_failed_context_is_retried_only_on_next_fetch(fake_runner, time_range) -> None:
+    match = _raw_message("match", "Bug", "1752559260000") | {"root_id": "root", "parent_id": "parent"}
+    parent = _raw_message("parent", "Original evidence", "1752559200000")
+    fake_runner.responses.extend([
+        {"items": [match]}, {"items": []}, {"items": []},
+        {"items": [match]}, {"items": [parent]}, {"items": []},
+    ])
+    gateway = FeishuGateway(fake_runner)
+
+    gateway.fetch_messages("oc_group_a", time_range)
+    assert gateway.last_missing_message_ids == ["parent"]
+    messages = gateway.fetch_messages("oc_group_a", time_range)
+
+    assert {item.message_id for item in messages} == {"match", "parent"}
+    assert gateway.last_missing_message_ids == []
+    assert len(fake_runner.calls) == 6
 
 
 def _raw_message(message_id: str, text: str, create_time: str) -> dict:

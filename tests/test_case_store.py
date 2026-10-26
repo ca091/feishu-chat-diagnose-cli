@@ -38,14 +38,15 @@ def test_completed_case_cannot_transition_backwards(tmp_path: Path) -> None:
         store.transition(state.case_id, "fetching_messages")
 
 
-def test_cancel_is_allowed_only_from_preview(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stage", ["awaiting_confirmation", "preparing_attachments", "diagnosing_repository"])
+def test_cancel_is_allowed_at_confirmation_stages(tmp_path: Path, stage) -> None:
     store = CaseStore(tmp_path)
     state = store.create({"repo_alias": "canvas-editor"})
 
     with pytest.raises(InvalidStageTransition):
         store.transition(state.case_id, "cancelled")
 
-    store.write_state(state.model_copy(update={"stage": "awaiting_confirmation"}))
+    store.write_state(state.model_copy(update={"stage": stage}))
     assert store.transition(state.case_id, "cancelled").stage == "cancelled"
 
 

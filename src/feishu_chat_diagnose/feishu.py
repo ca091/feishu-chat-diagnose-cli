@@ -141,12 +141,23 @@ class FeishuGateway:
             page_token = str(_payload_value(payload, "page_token", ""))
             if not page_token:
                 break
-        self._expand_quote_parents(messages)
-        self._expand_threads(messages)
+        attempted_parents: set[str] = set()
+        attempted_threads: set[str] = set()
+        incomplete_threads: set[str] = set()
+        while True:
+            previous_attempts = (len(attempted_parents), len(attempted_threads))
+            self._expand_quote_parents(messages, attempted_parents)
+            incomplete_threads.update(self._expand_threads(messages, attempted_threads))
+            if previous_attempts == (len(attempted_parents), len(attempted_threads)):
+                break
+        self.last_missing_message_ids = sorted(
+            (attempted_parents - messages.keys()) | incomplete_threads
+        )
         return sorted(messages.values(), key=_message_sort_key)
 
-    def _expand_quote_parents(self, messages: dict[str, NormalizedMessage]) -> None:
-        attempted: set[str] = set()
+    def _expand_quote_parents(
+        self, messages: dict[str, NormalizedMessage], attempted: set[str]
+    ) -> None:
         while True:
             missing = {
                 item.reply_to_message_id for item in messages.values()
@@ -169,14 +180,18 @@ class FeishuGateway:
                         raw = found.get(message_id)
                         if raw:
                             messages[message_id] = parse_message(raw)
-                        else:
-                            self.last_missing_message_ids.append(message_id)
                 except Exception:
-                    self.last_missing_message_ids.extend(batch)
+                    # Unresolved attempted IDs are reported after all expansion;
+                    # another thread response may still supply these messages.
+                    pass
 
-    def _expand_threads(self, messages: dict[str, NormalizedMessage]) -> None:
-        roots = sorted({item.thread_root_id for item in messages.values() if item.thread_root_id})
+    def _expand_threads(
+        self, messages: dict[str, NormalizedMessage], attempted: set[str]
+    ) -> set[str]:
+        roots = sorted({item.thread_root_id for item in messages.values() if item.thread_root_id} - attempted)
+        incomplete: set[str] = set()
         for root_id in roots:
+            attempted.add(root_id)
             page_token = ""
             try:
                 while True:
@@ -196,7 +211,8 @@ class FeishuGateway:
                     if not page_token:
                         break
             except Exception:
-                self.last_missing_message_ids.append(root_id)
+                incomplete.add(root_id)
+        return incomplete
 
     def download_attachment(
         self, attachment: AttachmentRef, root: Path, output_name: str

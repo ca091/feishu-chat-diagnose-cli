@@ -119,5 +119,29 @@ def test_case_commands_share_global_storage_from_any_directory(
         assert result.exit_code == 0, result.output
         assert "global report" in result.output
         result = CliRunner().invoke(app, ["resume", state.case_id])
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1, result.output
         assert "stage: failed" in result.output
+
+
+@pytest.mark.parametrize("command", ["analyze", "resume"])
+@pytest.mark.parametrize("stage,error,exit_code", [
+    ("failed", "diagnosis failed", 1), ("failed", "", 1),
+    ("completed", "", 0), ("cancelled", "", 0),
+])
+def test_diagnosis_commands_signal_failure_to_shell(tmp_path, mocker, command, stage, error, exit_code) -> None:
+    store = CaseStore(tmp_path / "cases")
+    state = store.create({"repo_alias": "demo"}).model_copy(update={"stage": stage, "error": error})
+    runtime = mocker.Mock(store=store)
+    runtime.analyze.return_value = state
+    runtime.resume.return_value = state
+    mocker.patch("feishu_chat_diagnose.cli.load_settings", return_value=Settings())
+    mocker.patch("feishu_chat_diagnose.cli.build_runtime", return_value=runtime)
+    args = (["analyze", "--group", "Test", "--repo", "demo"] if command == "analyze"
+            else ["resume", state.case_id])
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == exit_code, result.output
+    assert f"stage: {stage}" in result.output
+    if error:
+        assert f"error: {error}" in result.output

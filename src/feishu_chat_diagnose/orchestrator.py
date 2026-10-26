@@ -15,7 +15,7 @@ from .conversation import ConversationAssembler
 from .errors import ModelOutputError
 from .models import (
     AttachmentRef, CaseState, ConversationCandidate, ConversationIdentity, Diagnosis,
-    DiagnosisSkill, MessageBundle, NormalizedMessage, TimeRange,
+    DiagnosisSkill, FetchMetadata, MessageBundle, NormalizedMessage, TimeRange,
 )
 from .report import render_report
 from .progress import CaseProgressLogger, ProgressSink
@@ -100,10 +100,7 @@ class DiagnosisOrchestrator:
             raw_messages = self.feishu.fetch_messages(conversation.chat_id, request.time_range)
             if not raw_messages:
                 raise RuntimeError("No messages found in the selected time range")
-            self.store.write_json(
-                case_id, "raw_messages.json",
-                [item.model_dump(mode="json") for item in raw_messages],
-            )
+            fetch_metadata = self._write_fetch_checkpoint(case_id, raw_messages)
             logger.info("messages.fetched", f"消息拉取完成：{len(raw_messages)} 条")
 
             logger.info("context.assembling", "正在组装诊断上下文")
@@ -115,7 +112,7 @@ class DiagnosisOrchestrator:
                 raise RuntimeError("No messages match the requested context filter")
             bundle = MessageBundle(
                 conversation=conversation, time_range=request.time_range, messages=messages,
-                missing_message_ids=list(getattr(self.feishu, "last_missing_message_ids", [])),
+                missing_message_ids=fetch_metadata.missing_message_ids,
             )
             self.store.write_json(case_id, "messages.json", bundle.model_dump(mode="json"))
             logger.info("context.ready", f"诊断上下文已就绪：{len(messages)} 条消息")
@@ -171,13 +168,27 @@ class DiagnosisOrchestrator:
                 conversation = ConversationIdentity.model_validate(
                     self.store.read_json(case_id, "conversation.json")
                 )
-                raw = [
-                    NormalizedMessage.model_validate(item)
-                    for item in self.store.read_json(case_id, "raw_messages.json")
-                ]
+                metadata_path = self.store.case_dir(case_id) / "fetch_metadata.json"
+                if metadata_path.exists():
+                    raw = [
+                        NormalizedMessage.model_validate(item)
+                        for item in self.store.read_json(case_id, "raw_messages.json")
+                    ]
+                    fetch_metadata = FetchMetadata.model_validate(
+                        self.store.read_json(case_id, "fetch_metadata.json")
+                    )
+                else:
+                    self._logger(case_id).warning(
+                        "resume.legacy_checkpoint",
+                        "旧案例缺少缺失上下文记录，正在重新拉取消息以恢复完整状态",
+                    )
+                    raw = self.feishu.fetch_messages(conversation.chat_id, request.time_range)
+                    if not raw:
+                        raise RuntimeError("No messages found in the selected time range")
+                    fetch_metadata = self._write_fetch_checkpoint(case_id, raw)
                 return self._resume_assemble(
                     case_id, request, repository.path, conversation, raw, skill, confirm,
-                    enter_stage=False,
+                    fetch_metadata, enter_stage=False,
                 )
             bundle = MessageBundle.model_validate(self.store.read_json(case_id, "messages.json"))
             if resumed.stage == "awaiting_confirmation":
@@ -187,17 +198,11 @@ class DiagnosisOrchestrator:
                 self.store.transition(case_id, "preparing_attachments")
                 return self._materialize_and_diagnose(
                     case_id, repository.path, bundle, skill, confirmer,
-                    enter_preparing=False,
                 )
-            if resumed.stage == "preparing_attachments":
+            if resumed.stage in {"preparing_attachments", "diagnosing_repository"}:
                 return self._materialize_and_diagnose(
                     case_id, repository.path, bundle, skill,
                     confirm_partial=confirm or _confirmation_required,
-                    enter_preparing=False,
-                )
-            if resumed.stage == "diagnosing_repository":
-                return self._diagnose_with_temporary_attachments(
-                    case_id, repository.path, bundle, skill
                 )
             raise RuntimeError(f"Unsupported failed stage: {resumed.stage}")
         except Exception as error:
@@ -214,17 +219,16 @@ class DiagnosisOrchestrator:
         raw = self.feishu.fetch_messages(conversation.chat_id, request.time_range)
         if not raw:
             raise RuntimeError("No messages found in the selected time range")
-        self.store.write_json(
-            case_id, "raw_messages.json", [item.model_dump(mode="json") for item in raw]
-        )
+        fetch_metadata = self._write_fetch_checkpoint(case_id, raw)
         return self._resume_assemble(
-            case_id, request, repository, conversation, raw, skill, confirm
+            case_id, request, repository, conversation, raw, skill, confirm, fetch_metadata
         )
 
     def _resume_assemble(
         self, case_id: str, request: AnalyzeRequest, repository: Path,
         conversation: ConversationIdentity, raw: list[NormalizedMessage],
         skill: DiagnosisSkill | None, confirm: Confirm | None,
+        fetch_metadata: FetchMetadata,
         *, enter_stage: bool = True,
     ) -> CaseState:
         if enter_stage:
@@ -236,7 +240,7 @@ class DiagnosisOrchestrator:
             raise RuntimeError("No messages match the requested context filter")
         bundle = MessageBundle(
             conversation=conversation, time_range=request.time_range, messages=messages,
-            missing_message_ids=list(getattr(self.feishu, "last_missing_message_ids", [])),
+            missing_message_ids=fetch_metadata.missing_message_ids,
         )
         self.store.write_json(case_id, "messages.json", bundle.model_dump(mode="json"))
         self.store.transition(case_id, "awaiting_confirmation")
@@ -245,8 +249,23 @@ class DiagnosisOrchestrator:
             return self.store.transition(case_id, "cancelled")
         self.store.transition(case_id, "preparing_attachments")
         return self._materialize_and_diagnose(
-            case_id, repository, bundle, skill, confirmer, enter_preparing=False
+            case_id, repository, bundle, skill, confirmer
         )
+
+    def _write_fetch_checkpoint(
+        self, case_id: str, messages: list[NormalizedMessage]
+    ) -> FetchMetadata:
+        metadata = FetchMetadata(
+            missing_message_ids=list(getattr(self.feishu, "last_missing_message_ids", []))
+        )
+        # Publish metadata last so an interrupted write cannot pair new metadata
+        # with stale messages. An incomplete checkpoint will be fetched again.
+        (self.store.case_dir(case_id) / "fetch_metadata.json").unlink(missing_ok=True)
+        self.store.write_json(
+            case_id, "raw_messages.json", [item.model_dump(mode="json") for item in messages]
+        )
+        self.store.write_json(case_id, "fetch_metadata.json", metadata.model_dump(mode="json"))
+        return metadata
 
     def _resolve(self, request: AnalyzeRequest, choose: ChooseCandidate) -> ConversationIdentity:
         candidates = (
@@ -264,10 +283,7 @@ class DiagnosisOrchestrator:
     def _materialize_and_diagnose(
         self, case_id: str, repository: Path, bundle: MessageBundle,
         skill: DiagnosisSkill | None, confirm_partial: Confirm,
-        *, enter_preparing: bool = False,
     ) -> CaseState:
-        if enter_preparing:
-            self.store.transition(case_id, "preparing_attachments")
         refs = _attachments(bundle)
         with tempfile.TemporaryDirectory(prefix="feishu-diagnose-") as directory:
             manager = AttachmentManager(
@@ -278,33 +294,13 @@ class DiagnosisOrchestrator:
                 if batch.failed and not confirm_partial(self._failure_preview(batch)):
                     result = self.store.transition(case_id, "cancelled")
                 else:
-                    self.store.transition(case_id, "diagnosing_repository")
+                    if self.store.read_state(case_id).stage != "diagnosing_repository":
+                        self.store.transition(case_id, "diagnosing_repository")
                     result = self._run_codex(
                         case_id, repository, bundle, batch, Path(directory), skill
                     )
         if result.stage == "completed":
             self._logger(case_id).info("case.completed", "诊断完成，报告已保存")
-        return result
-
-    def _diagnose_with_temporary_attachments(
-        self, case_id: str, repository: Path, bundle: MessageBundle,
-        skill: DiagnosisSkill | None,
-    ) -> CaseState:
-        refs = _attachments(bundle)
-        with tempfile.TemporaryDirectory(prefix="feishu-diagnose-") as directory:
-            manager = AttachmentManager(
-                self.feishu, Path(directory), self.settings.defaults.max_text_attachment_bytes,
-                progress=self._logger(case_id).forward,
-            )
-            with manager.materialize(refs) as batch:
-                if batch.failed:
-                    raise RuntimeError("Attachment download failed during resume: " + "; ".join(
-                        item.reason for item in batch.failed
-                    ))
-                result = self._run_codex(
-                    case_id, repository, bundle, batch, Path(directory), skill
-                )
-        self._logger(case_id).info("case.completed", "诊断完成，报告已保存")
         return result
 
     def _run_codex(

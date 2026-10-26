@@ -75,6 +75,7 @@ class Settings(BaseModel):
         skills_root = (repository.path / ".agents" / "skills").resolve()
         skill_path = (skills_root / selected / "SKILL.md").resolve()
         try:
+            skills_root.relative_to(repository.path)
             skill_path.relative_to(skills_root)
         except ValueError as exc:
             raise ConfigurationError(

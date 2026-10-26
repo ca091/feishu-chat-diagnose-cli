@@ -16,7 +16,7 @@ _NEXT: dict[CaseStage, set[CaseStage]] = {
     "assembling_context": {"awaiting_confirmation"},
     "awaiting_confirmation": {"preparing_attachments", "cancelled"},
     "preparing_attachments": {"diagnosing_repository", "cancelled"},
-    "diagnosing_repository": {"completed"},
+    "diagnosing_repository": {"completed", "cancelled"},
     "completed": set(),
     "failed": set(),
     "cancelled": set(),

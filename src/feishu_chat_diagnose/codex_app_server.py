@@ -51,6 +51,7 @@ class StdioJsonRpcTransport:
         self.clock = clock
         self._next_id = 1
         self._pending: list[dict[str, Any]] = []
+        self._read_buffer = bytearray()
 
     def set_progress(self, progress: ProgressSink | None) -> None:
         self.progress = progress or (lambda event: None)
@@ -98,6 +99,11 @@ class StdioJsonRpcTransport:
         started = self.clock()
         deadline = started + self.timeout_seconds
         while True:
+            newline = self._read_buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(self._read_buffer[:newline])
+                del self._read_buffer[:newline + 1]
+                return json.loads(line)
             now = self.clock()
             remaining = deadline - now
             if remaining <= 0:
@@ -113,16 +119,22 @@ class StdioJsonRpcTransport:
                 [self.process.stdout], [], [], wait_seconds
             )
             if readable:
-                break
+                # Read bytes directly: TextIOWrapper.readline() both prefetches
+                # later messages and can block indefinitely on a partial line.
+                chunk = os.read(self.process.stdout.fileno(), 65536)
+                if chunk:
+                    self._read_buffer.extend(chunk)
+                    continue
+                if self._read_buffer:
+                    line = bytes(self._read_buffer)
+                    self._read_buffer.clear()
+                    return json.loads(line)
+                raise RuntimeError(f"Codex app-server exited with code {self.process.poll()}")
             elapsed = self.clock() - started
             self._emit(
                 "INFO", "codex.heartbeat",
                 f"Codex 正在执行，已等待 {elapsed:.0f} 秒",
             )
-        line = self.process.stdout.readline()
-        if not line:
-            raise RuntimeError(f"Codex app-server exited with code {self.process.poll()}")
-        return json.loads(line)
 
     def _emit(self, level: ProgressLevel, name: str, message: str) -> None:
         try:

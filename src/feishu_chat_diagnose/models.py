@@ -77,6 +77,10 @@ class NormalizedMessage(BaseModel):
     attachments: list[AttachmentRef] = Field(default_factory=list)
 
 
+class FetchMetadata(BaseModel):
+    missing_message_ids: list[str]
+
+
 class MessageBundle(BaseModel):
     conversation: ConversationIdentity
     time_range: TimeRange

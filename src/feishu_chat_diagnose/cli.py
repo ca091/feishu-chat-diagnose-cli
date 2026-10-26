@@ -105,6 +105,8 @@ def analyze(
     typer.echo(f"case: {state.case_id}\nstage: {state.stage}")
     if state.error:
         typer.echo(f"error: {state.error}", err=True)
+    if state.stage == "failed":
+        raise typer.Exit(code=1)
 
 
 @app.command("list")
@@ -139,6 +141,8 @@ def resume(case_id: str, config: Annotated[Path | None, typer.Option("--config")
     typer.echo(f"case: {state.case_id}\nstage: {state.stage}")
     if state.error:
         typer.echo(f"error: {state.error}", err=True)
+    if state.stage == "failed":
+        raise typer.Exit(code=1)
 
 
 @app.command()

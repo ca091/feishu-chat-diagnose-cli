@@ -38,3 +38,42 @@ def test_messages_are_deduplicated_and_sorted(message_factory) -> None:
     result = ConversationAssembler(max_messages=3).assemble([later, earlier, later], keyword="")
 
     assert [item.message_id for item in result] == ["om_earlier", "om_later"]
+
+
+def test_keyword_context_closes_over_sibling_quotes_and_linked_threads(message_factory) -> None:
+    messages = [
+        message_factory("parent", "Earlier context"),
+        message_factory("root", "First thread", minute=1),
+        message_factory("match", "Bug", thread_root_id="root", minute=2),
+        message_factory("sibling", "See this", thread_root_id="root",
+                        reply_to_message_id="linked", minute=3),
+        message_factory("linked", "Related", thread_root_id="root2", minute=4),
+        message_factory("root2", "Second thread", minute=5),
+        message_factory("sibling2", "More context", thread_root_id="root2",
+                        reply_to_message_id="parent", minute=6),
+        message_factory("other", "Unrelated", minute=7),
+    ]
+
+    result = ConversationAssembler(max_messages=7).assemble(messages, keyword="bug")
+
+    assert [item.message_id for item in result] == [item.message_id for item in messages[:-1]]
+    with pytest.raises(ContextTooLarge, match="7 messages exceeds limit 6"):
+        ConversationAssembler(max_messages=6).assemble(messages, keyword="bug")
+
+
+def test_keyword_on_thread_root_includes_replies_without_root_self_reference(message_factory) -> None:
+    messages = [
+        message_factory("root", "Bug"),
+        message_factory("reply", "Reproduced", thread_root_id="root", minute=1),
+    ]
+
+    assert ConversationAssembler(max_messages=2).assemble(messages, keyword="bug") == messages
+
+
+def test_quote_cycles_terminate(message_factory) -> None:
+    messages = [
+        message_factory("first", "Bug", reply_to_message_id="second"),
+        message_factory("second", "Context", reply_to_message_id="first", minute=1),
+    ]
+
+    assert ConversationAssembler(max_messages=2).assemble(messages, keyword="bug") == messages

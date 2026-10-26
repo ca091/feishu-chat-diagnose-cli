@@ -21,18 +21,24 @@ class ConversationAssembler:
                 for message in by_id.values()
                 if needle in message.text.casefold()
             }
-            self._include_quote_ancestors(selected, by_id)
-            roots = {
-                by_id[message_id].thread_root_id
-                for message_id in selected
-                if by_id[message_id].thread_root_id
-            }
-            selected.update(roots)
-            selected.update(
-                message.message_id
-                for message in by_id.values()
-                if message.thread_root_id in roots
-            )
+            while True:
+                previous_count = len(selected)
+                self._include_quote_ancestors(selected, by_id)
+                roots = {
+                    message.thread_root_id
+                    for message in by_id.values()
+                    if message.thread_root_id and (
+                        message.message_id in selected or message.thread_root_id in selected
+                    )
+                }
+                selected.update(root for root in roots if root in by_id)
+                selected.update(
+                    message.message_id
+                    for message in by_id.values()
+                    if message.thread_root_id in roots
+                )
+                if len(selected) == previous_count:
+                    break
 
         result = sorted(
             (by_id[message_id] for message_id in selected if message_id in by_id),

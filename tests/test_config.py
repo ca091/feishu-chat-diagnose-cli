@@ -4,6 +4,7 @@ import pytest
 
 from feishu_chat_diagnose.config import Settings, load_settings, resolve_config_path
 from feishu_chat_diagnose.errors import ConfigurationError
+from feishu_chat_diagnose.models import RepositorySettings
 
 
 def test_load_settings_resolves_allowlisted_repository(tmp_path: Path) -> None:
@@ -163,3 +164,37 @@ def test_local_config_is_not_implicitly_loaded(diagnose_home, tmp_path, monkeypa
     legacy.write_text("", encoding="utf-8")
     with pytest.raises(ConfigurationError, match="feishu-diagnose init"):
         load_settings()
+
+
+@pytest.mark.parametrize("linked_path", [".agents", ".agents/skills", ".agents/skills/bugfix", ".agents/skills/bugfix/SKILL.md"])
+def test_skill_rejects_symlinks_outside_repository(tmp_path, linked_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = repo / linked_path
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.name == "SKILL.md":
+        target = outside / "SKILL.md"
+    else:
+        target = outside
+    suffix = Path(".agents/skills/bugfix/SKILL.md").relative_to(linked_path)
+    skill = target / suffix if str(suffix) != "." else target
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text("Test skill", encoding="utf-8")
+    link.symlink_to(target, target_is_directory=target.is_dir())
+    settings = Settings(repositories={"repo": RepositorySettings(path=repo, diagnosis_skill="bugfix")})
+
+    with pytest.raises(ConfigurationError, match="escapes repository skill root"):
+        settings.diagnosis_skill("repo")
+
+
+def test_skill_allows_symlinks_contained_in_repository(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    skill = repo / "agent-config/skills/bugfix/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("Test skill", encoding="utf-8")
+    (repo / ".agents").symlink_to(repo / "agent-config", target_is_directory=True)
+    settings = Settings(repositories={"repo": RepositorySettings(path=repo, diagnosis_skill="bugfix")})
+
+    assert settings.diagnosis_skill("repo").path == skill.resolve()
