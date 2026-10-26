@@ -1,3 +1,4 @@
+import pytest
 from typer.testing import CliRunner
 
 from feishu_chat_diagnose.case_store import CaseStore
@@ -15,7 +16,7 @@ def test_analyze_rejects_group_and_person_together() -> None:
 def test_help_lists_operator_commands() -> None:
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
-    for command in ("doctor", "analyze", "list", "show", "resume"):
+    for command in ("init", "doctor", "analyze", "list", "show", "resume"):
         assert command in result.output
 
 
@@ -68,3 +69,55 @@ def test_show_displays_only_recent_execution_log_lines(tmp_path) -> None:
     assert "最近执行日志" in result.output
     assert "line-34" in result.output
     assert "line-0" not in result.output
+
+
+@pytest.mark.parametrize("args", [
+    ["doctor"], ["list"], ["show", "missing"], ["resume", "missing"],
+    ["analyze", "--group", "Test", "--repo", "demo"],
+])
+def test_missing_global_config_explains_init_without_traceback(
+    diagnose_home, tmp_path, monkeypatch, args
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 1
+    assert "feishu-diagnose init" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_help_works_before_initialization(diagnose_home) -> None:
+    assert CliRunner().invoke(app, ["--help"]).exit_code == 0
+    assert not diagnose_home.exists()
+
+
+def test_case_commands_share_global_storage_from_any_directory(
+    diagnose_home, tmp_path, monkeypatch
+) -> None:
+    diagnose_home.mkdir()
+    (diagnose_home / "config.toml").write_text(
+        '[defaults]\ncase_dir = "cases"\n', encoding="utf-8"
+    )
+    store = CaseStore(diagnose_home / "cases")
+    state = store.create({"repo_alias": "demo"})
+    store.transition(state.case_id, "resolving_conversation")
+    store.fail(state.case_id, "resolving_conversation", "example failure")
+    store.write_text(state.case_id, "report.md", "global report")
+
+    def fake_resume(runtime, case_id, **kwargs):
+        assert runtime.store.root == diagnose_home / "cases"
+        return runtime.store.read_state(case_id)
+
+    monkeypatch.setattr("feishu_chat_diagnose.cli.DiagnosisOrchestrator.resume", fake_resume)
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    for cwd in (tmp_path, unrelated):
+        monkeypatch.chdir(cwd)
+        result = CliRunner().invoke(app, ["list"])
+        assert result.exit_code == 0, result.output
+        assert state.case_id in result.output
+        result = CliRunner().invoke(app, ["show", state.case_id])
+        assert result.exit_code == 0, result.output
+        assert "global report" in result.output
+        result = CliRunner().invoke(app, ["resume", state.case_id])
+        assert result.exit_code == 0, result.output
+        assert "stage: failed" in result.output

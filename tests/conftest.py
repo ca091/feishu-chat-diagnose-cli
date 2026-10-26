@@ -9,6 +9,15 @@ import pytest
 from feishu_chat_diagnose.models import NormalizedMessage, Sender, TimeRange
 
 
+@pytest.fixture
+def diagnose_home(tmp_path: Path, monkeypatch) -> Path:
+    home = tmp_path / "user home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("FEISHU_DIAGNOSE_CONFIG", raising=False)
+    return home / ".feishu-diagnose"
+
+
 class FakeLarkRunner:
     def __init__(self) -> None:
         self.responses: list[dict[str, Any]] = []

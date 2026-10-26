@@ -8,6 +8,7 @@ Requires-Dist: google-genai<2,>=1
 Requires-Dist: mcp<2,>=1
 Requires-Dist: pydantic<3,>=2.10
 Requires-Dist: typer<1,>=0.16
+Requires-Dist: tomlkit<1,>=0.13
 Provides-Extra: dev
 Requires-Dist: pytest<9,>=8.3; extra == "dev"
 Requires-Dist: pytest-mock<4,>=3.14; extra == "dev"
@@ -19,11 +20,18 @@ Requires-Dist: pytest-mock<4,>=3.14; extra == "dev"
 ## 安装
 
 ```bash
-uv sync --python 3.12 --extra dev
-cp config/config.example.toml config/config.toml
+# 在项目目录执行一次安装，使用 uv.lock 中已验证的依赖版本。
+diagnose_constraints="$(mktemp)"
+uv export --locked --no-dev --no-emit-project --no-hashes --output-file "$diagnose_constraints"
+uv tool install --python 3.12 --constraints "$diagnose_constraints" .
+# 若安装时提示命令目录不在 PATH 中，执行后重新打开终端。
+uv tool update-shell
+
+# 首次升级时在旧项目目录执行，以自动迁移配置；之后可在任意目录使用。
+feishu-diagnose init
 ```
 
-在 `config/config.toml` 中配置允许诊断的仓库绝对路径、默认诊断 Skill、可覆盖的 Skill 白名单与视频模型。Skill 必须位于目标仓库的 `.agents/skills/<name>/SKILL.md`：
+在 `~/.feishu-diagnose/config.toml` 中配置允许诊断的仓库绝对路径、默认诊断 Skill、可覆盖的 Skill 白名单与视频模型。Skill 必须位于目标仓库的 `.agents/skills/<name>/SKILL.md`：
 
 ```toml
 [repositories.demo-project]
@@ -34,6 +42,31 @@ allowed_skills = ["project-bugfix", "performance-optimization"]
 ```
 
 仓库只能通过别名选择，聊天内容不能改变仓库、Skill 或权限。`diagnosis_skill` 可以留空；设置后将作为该仓库的默认诊断流程。
+
+### 全局配置与初始化
+
+```text
+~/.feishu-diagnose/
+├── config.toml
+└── cases/
+    └── <case-id>/
+```
+
+`init` 生成带注释的配置模板和案例目录，不调用外部服务；重复执行会保留已有全局配置。如果当前目录存在旧的 `config/config.toml` 且全局配置尚不存在，会自动迁移配置：保留注释及模型、Skill 等设置，将相对仓库和可执行文件路径按当前项目目录转换为绝对路径，并将 `case_dir` 改为 `cases`。原配置保留，旧案例不迁移。旧配置无效时会报错，不会用模板替代。
+
+因此，从旧版本升级时，应先在旧项目目录运行一次 `feishu-diagnose init`，之后即可在任意目录使用。若之前已设置 `FEISHU_DIAGNOSE_CONFIG`，迁移后请取消该变量或指向新配置，否则普通命令仍会使用旧配置。
+
+配置优先级为：各子命令的 `--config` → `FEISHU_DIAGNOSE_CONFIG` → `~/.feishu-diagnose/config.toml`。普通命令不再自动读取当前目录的配置；`init` 始终初始化全局位置。缺少配置时会提示初始化。
+
+```bash
+feishu-diagnose list --config /absolute/path/to/other-config.toml
+```
+
+配置文件路径支持 `~`，相对路径按调用目录解析；配置内的仓库和案例相对路径按配置文件所在目录解析。未设置 `case_dir` 时始终使用全局案例目录。普通可执行命令名通过 `PATH` 查找，可执行文件路径按配置目录解析。显式使用旧配置时，也适用新的相对路径规则；请先将旧相对路径改为绝对路径。
+
+`uv tool install` 默认不读取项目的 `uv.lock`；上述导出约束的步骤让安装与测试使用相同的依赖版本，避免重新解析出需要额外编译环境的新版本。临时约束文件无需保留到项目中。
+
+源码或依赖更新后，重新导出约束并执行安装命令，添加 `--reinstall`。开发时在安装命令中增加 `--editable`，源码修改直接生效，依赖或入口变更仍需重新安装。仓库内开发与测试继续使用 `uv sync --python 3.12 --extra dev` 和 `uv run pytest`，也可运行 `uv run feishu-diagnose ...`。
 
 飞书访问使用当前用户身份，需要先完成 `lark-cli` 登录，并授权以下只读 scope：
 
@@ -50,15 +83,15 @@ contact:user.base:readonly
 ```bash
 export GEMINI_API_KEY="你的 Gemini API Key"
 GEMINI_API_KEY="你的 Key" \
-uv run feishu-diagnose doctor
-uv run feishu-diagnose analyze --group "示例群" --repo demo-project --since 2h
-uv run feishu-diagnose analyze --group "示例群" --repo demo-project --skill project-bugfix --since 2h
-uv run feishu-diagnose analyze --group "研发示例群" --repo demo-project --since 2h
-uv run feishu-diagnose analyze --person "张三" --repo demo-project --start "2026-07-15 16:00" --end "2026-07-15 17:00"
-uv run feishu-diagnose analyze --person "张三" --repo demo-project --skill project-bugfix --since 2h
-uv run feishu-diagnose list
-uv run feishu-diagnose show <case-id>
-uv run feishu-diagnose resume <case-id>
+feishu-diagnose doctor
+feishu-diagnose analyze --group "示例群" --repo demo-project --since 2h
+feishu-diagnose analyze --group "示例群" --repo demo-project --skill project-bugfix --since 2h
+feishu-diagnose analyze --group "研发示例群" --repo demo-project --since 2h
+feishu-diagnose analyze --person "张三" --repo demo-project --start "2026-07-15 16:00" --end "2026-07-15 17:00"
+feishu-diagnose analyze --person "张三" --repo demo-project --skill project-bugfix --since 2h
+feishu-diagnose list
+feishu-diagnose show <case-id>
+feishu-diagnose resume <case-id>
 ```
 
 `analyze` 会先显示消息、图片、视频和文件数量，默认不继续；附件下载不完整时还会进行第二次确认。模型输出不符合 Schema、Codex 失败或视频工具失败时都不会自动重试，只有显式执行 `resume` 才会再次启动诊断。
@@ -68,8 +101,8 @@ uv run feishu-diagnose resume <case-id>
 确认后，终端会持续输出会话、附件、Skill 选择、Codex 初始化、工具步骤和报告保存进度。Codex 暂无新事件时每 10 秒输出一次等待心跳。相同事件会写入 case 的 `execution.log`：
 
 ```bash
-tail -f data/cases/<case-id>/execution.log
-uv run feishu-diagnose show <case-id>
+tail -f ~/.feishu-diagnose/cases/<case-id>/execution.log
+feishu-diagnose show <case-id>
 ```
 
 执行日志不包含聊天正文、附件内容、附件 key、临时文件路径、密钥、原始命令参数或模型完整响应。
@@ -193,7 +226,7 @@ flowchart TD
 
 ## 数据与边界
 
-case 保存在 `data/cases/<case-id>/`，其中可能包含私聊正文；`data/` 已加入 `.gitignore`。图片、视频和普通附件只存在于运行期临时目录，结束后删除。Gemini 仅作为 Codex 可调用的原始视频理解工具，最终问题归因和仓库分析只由同一个 Codex turn 完成。
+case 默认保存在 `~/.feishu-diagnose/cases/<case-id>/`，其中可能包含私聊正文，请勿提交或公开分享。图片、视频和普通附件只存在于运行期临时目录，结束后删除。Gemini 仅作为 Codex 可调用的原始视频理解工具，最终问题归因和仓库分析只由同一个 Codex turn 完成。
 
 首版不提供机器人、消息监听、飞书回复、代码修改、提交或推送，也没有自动重试。
 

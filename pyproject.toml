@@ -13,6 +13,7 @@ dependencies = [
   "mcp>=1,<2",
   "pydantic>=2.10,<3",
   "typer>=0.16,<1",
+  "tomlkit>=0.13,<1",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,9 @@ feishu-diagnose = "feishu_chat_diagnose.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+feishu_chat_diagnose = ["config.example.toml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

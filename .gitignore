@@ -2,6 +2,7 @@
 __pycache__/
 .pytest_cache/
 dist/
+build
 
 # Local configuration and credentials
 .env
@@ -22,3 +23,4 @@ lark-im-resources/
 
 .idea
 .codegraph
+AI.md

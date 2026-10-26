@@ -11,7 +11,9 @@ import typer
 from .case_store import CaseStore
 from .codex_app_server import CodexAppServerDiagnosis
 from .config import Settings, load_settings
+from .errors import ConfigurationError
 from .feishu import FeishuGateway
+from .initialization import initialize
 from .lark_runner import LarkCliRunner
 from .models import ConversationCandidate
 from .orchestrator import AnalyzeRequest, DiagnosisOrchestrator
@@ -26,6 +28,35 @@ REQUIRED_FEISHU_SCOPES = (
     "im:message.p2p_msg:get_as_user",
     "contact:user.base:readonly",
 )
+
+
+def _load_settings(config: Path | None) -> Settings:
+    try:
+        return load_settings(config)
+    except ConfigurationError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def init() -> None:
+    """初始化 ~/.feishu-diagnose；发现当前目录的旧配置时仅迁移配置。"""
+    try:
+        result = initialize()
+    except ConfigurationError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if result.status == "existing":
+        typer.echo("全局配置已存在，保留原文件。")
+    elif result.status == "migrated":
+        typer.echo(f"已迁移配置：{result.source}（原文件保留）")
+        typer.echo("案例目录已改为全局位置；旧案例未迁移，仍保留在原处。")
+    else:
+        typer.echo("已生成带注释的配置模板。")
+    typer.echo(f"配置文件：{result.config_path}\n默认案例目录：{result.case_directory}")
+    typer.echo("请编辑配置中的仓库、Skill 和视频模型，完成授权并设置 GEMINI_API_KEY 后运行 feishu-diagnose doctor。")
+    if os.environ.get("FEISHU_DIAGNOSE_CONFIG"):
+        typer.echo("提示：FEISHU_DIAGNOSE_CONFIG 已设置，普通命令仍优先使用它；init 始终初始化全局位置。")
 
 
 def build_runtime(
@@ -61,7 +92,7 @@ def analyze(
 ) -> None:
     if bool(group) == bool(person):
         raise typer.BadParameter("--group and --person are mutually exclusive; specify exactly one")
-    settings = load_settings(config)
+    settings = _load_settings(config)
     time_range = resolve_time_range(
         since=since or (settings.defaults.message_window if not start and not end else None),
         start=start or None, end=end or None,
@@ -78,14 +109,14 @@ def analyze(
 
 @app.command("list")
 def list_cases(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
-    store = CaseStore(load_settings(config).defaults.case_dir)
+    store = CaseStore(_load_settings(config).defaults.case_dir)
     for state in store.list_states():
         typer.echo(f"{state.case_id}\t{state.stage}\t{state.updated_at.isoformat()}")
 
 
 @app.command()
 def show(case_id: str, config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
-    store = CaseStore(load_settings(config).defaults.case_dir)
+    store = CaseStore(_load_settings(config).defaults.case_dir)
     typer.echo(store.read_state(case_id).model_dump_json(indent=2))
     for name in ("report.md", "failure.json"):
         path = store.case_dir(case_id) / name
@@ -101,7 +132,7 @@ def show(case_id: str, config: Annotated[Path | None, typer.Option("--config")] 
 
 @app.command()
 def resume(case_id: str, config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
-    runtime = build_runtime(load_settings(config), _render_progress)
+    runtime = build_runtime(_load_settings(config), _render_progress)
     before = runtime.store.read_state(case_id)
     typer.echo(f"Resuming failed stage: {before.failed_stage}")
     state = runtime.resume(case_id, choose=_choose_candidate, confirm=_confirm)
@@ -112,7 +143,7 @@ def resume(case_id: str, config: Annotated[Path | None, typer.Option("--config")
 
 @app.command()
 def doctor(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
-    settings = load_settings(config)
+    settings = _load_settings(config)
     typer.echo("configuration: ok")
     for alias in settings.repositories:
         settings.repository(alias)

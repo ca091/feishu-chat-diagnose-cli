@@ -5,10 +5,12 @@ src/feishu_chat_diagnose/attachments.py
 src/feishu_chat_diagnose/case_store.py
 src/feishu_chat_diagnose/cli.py
 src/feishu_chat_diagnose/codex_app_server.py
+src/feishu_chat_diagnose/config.example.toml
 src/feishu_chat_diagnose/config.py
 src/feishu_chat_diagnose/conversation.py
 src/feishu_chat_diagnose/errors.py
 src/feishu_chat_diagnose/feishu.py
+src/feishu_chat_diagnose/initialization.py
 src/feishu_chat_diagnose/lark_runner.py
 src/feishu_chat_diagnose/models.py
 src/feishu_chat_diagnose/orchestrator.py
@@ -29,6 +31,7 @@ tests/test_codex_app_server.py
 tests/test_config.py
 tests/test_conversation.py
 tests/test_feishu.py
+tests/test_initialization.py
 tests/test_lark_runner.py
 tests/test_orchestrator.py
 tests/test_progress.py

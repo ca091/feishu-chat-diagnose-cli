@@ -14,9 +14,17 @@ from .models import DiagnosisSkill, RepositorySettings
 SKILL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
+def global_directory() -> Path:
+    return Path.home() / ".feishu-diagnose"
+
+
+def default_case_directory() -> Path:
+    return global_directory() / "cases"
+
+
 class DefaultsSettings(BaseModel):
     message_window: str = "2h"
-    case_dir: Path = Path("data/cases")
+    case_dir: Path = Field(default_factory=default_case_directory)
     max_messages: int = 300
     max_text_attachment_bytes: int = 1_048_576
 
@@ -78,21 +86,44 @@ class Settings(BaseModel):
 
 
 def resolve_config_path(path: Path | None = None) -> Path:
-    if path is not None:
-        return path
     configured = os.environ.get("FEISHU_DIAGNOSE_CONFIG")
-    return Path(configured) if configured else Path("config/config.toml")
+    selected = path if path is not None else (
+        Path(configured) if configured else global_directory() / "config.toml"
+    )
+    return selected.expanduser().resolve()
+
+
+def resolve_path(path: Path, base: Path) -> Path:
+    expanded = path.expanduser()
+    return (expanded if expanded.is_absolute() else base / expanded).resolve()
+
+
+def resolve_executable(command: str, base: Path) -> str:
+    # Bare executable names must remain available for PATH lookup.
+    if "/" in command or "\\" in command or command.startswith(("~", ".")):
+        return str(resolve_path(Path(command), base))
+    return command
+
+
+def normalize_paths(settings: Settings, base: Path) -> Settings:
+    settings.defaults.case_dir = resolve_path(settings.defaults.case_dir, base)
+    for repository in settings.repositories.values():
+        repository.path = resolve_path(repository.path, base)
+    settings.feishu.lark_cli_bin = resolve_executable(settings.feishu.lark_cli_bin, base)
+    settings.codex.bin = resolve_executable(settings.codex.bin, base)
+    return settings
 
 
 def load_settings(path: Path | None = None) -> Settings:
     config_path = resolve_config_path(path)
     if not config_path.exists():
-        if path is None and "FEISHU_DIAGNOSE_CONFIG" not in os.environ:
-            return Settings()
-        raise ConfigurationError(f"Configuration file does not exist: {config_path}")
+        raise ConfigurationError(
+            f"Configuration file does not exist: {config_path}. "
+            "Run 'feishu-diagnose init' to initialize the global configuration."
+        )
     try:
         payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        settings = Settings.model_validate(payload)
+        settings = normalize_paths(Settings.model_validate(payload), config_path.parent)
     except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:
         raise ConfigurationError(f"Invalid configuration: {exc}") from exc
     for alias in settings.repositories:
