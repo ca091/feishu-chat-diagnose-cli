@@ -69,11 +69,10 @@ contact:user.base:readonly
 
 ```bash
 export GEMINI_API_KEY="你的 Gemini API Key"
-GEMINI_API_KEY="你的 Key" \
 feishu-diagnose doctor
 feishu-diagnose analyze --group "示例群" --repo demo-project --since 2h
 feishu-diagnose analyze --group "示例群" --repo demo-project --skill project-bugfix --since 2h
-feishu-diagnose analyze --group "研发示例群" --repo demo-project --since 2h
+feishu-diagnose analyze --group "示例群" --repo demo-project --keyword "导出" --since 2h
 feishu-diagnose analyze --person "张三" --repo demo-project --start "2026-07-15 16:00" --end "2026-07-15 17:00"
 feishu-diagnose analyze --person "张三" --repo demo-project --skill project-bugfix --since 2h
 feishu-diagnose list
@@ -83,11 +82,15 @@ feishu-diagnose resume <case-id>
 
 `analyze` 会先显示消息、图片、视频和文件数量，默认不继续；附件下载不完整时还会进行第二次确认。模型输出不符合 Schema、Codex 失败或视频工具失败时都不会自动重试，只有显式执行 `resume` 才会再次启动诊断。
 
-`resume` 会重新下载诊断所需附件，下载不完整时须再次确认，可继续使用可用附件或取消；临时文件在完成、失败或取消后清理。`analyze` 和 `resume` 以 `stage: failed` 结束时返回退出码 `1`，正常完成或用户取消时返回 `0`。
+消息拉取会交替补全引用父消息和关联话题，直到没有尚未尝试的关联；话题新增消息的引用也会继续补全，因此上下文可能超出所选时间范围。同一次拉取中，每个引用目标和话题只补全一次（话题接口会分页），失败项会显示在缺失提示中。
 
-消息拉取结果保存在 `raw_messages.json`，缺失的引用或话题消息 ID 保存在 `fetch_metadata.json`；恢复上下文组装时会一并读取，保留缺失提示。旧案例缺少这份元数据时，会提示并重新拉取该时间范围的消息，再进行预览确认。
+`--keyword` 按消息正文筛选，并保留关联引用链和话题。`defaults.max_messages` 限制最终组装的消息数；超限会报错，不会截断上下文。
 
-没有传 `--skill` 时使用仓库的 `diagnosis_skill`；传入时只能选择 `allowed_skills` 中的 Skill。CLI 会先校验本地文件，再通过 app-server `skills/list` 确认 Codex 已发现并启用它，最后以原生 Skill 输入显式激活。实际使用的 Skill 会写入 `diagnosis.json`、`report.md` 和执行日志。
+`resume` 只支持失败案例，从记录的失败阶段继续；已完成或已取消的案例需重新执行 `analyze`。恢复到附件准备或诊断阶段时会重新下载附件，下载不完整须再次确认，可继续使用可用附件或取消；临时文件在完成、失败或取消后清理。`analyze` 和 `resume` 以 `stage: failed` 结束时返回退出码 `1`，正常完成或用户取消时返回 `0`。
+
+原始消息保存在 `raw_messages.json`，缺失上下文记录保存在 `fetch_metadata.json`，组装结果保存在 `messages.json`。恢复上下文组装时会一并读取原始消息和缺失记录；若旧案例或写入中断导致缺少元数据，会提示并重新拉取原时间范围的消息，再进行预览确认。
+
+没有传 `--skill` 时使用仓库的 `diagnosis_skill`；传入时可选择仓库默认 Skill 或 `allowed_skills` 中的名称。CLI 会先校验本地文件，再通过 app-server `skills/list` 确认 Codex 已发现并启用它，最后以原生 Skill 输入显式激活。实际使用的 Skill 会写入 `diagnosis.json`、`report.md` 和执行日志。
 
 确认后，终端会持续输出会话、附件、Skill 选择、Codex 初始化、工具步骤和报告保存进度。Codex 暂无新事件时每 10 秒输出一次等待心跳。相同事件会写入 case 的 `execution.log`：
 
@@ -95,6 +98,8 @@ feishu-diagnose resume <case-id>
 tail -f ~/.feishu-diagnose/cases/<case-id>/execution.log
 feishu-diagnose show <case-id>
 ```
+
+`codex.timeout_seconds` 是等待下一条完整 Codex 响应或事件的上限，不是整个诊断的总时限；等待心跳不会延长该上限。
 
 执行日志不包含聊天正文、附件内容、附件 key、临时文件路径、密钥、原始命令参数或模型完整响应。
 
@@ -113,9 +118,11 @@ flowchart TD
         CHOOSE{"存在多个候选？"}
         SELECT["用户选择唯一会话"]
         FETCH["分页拉取消息"]
-        EXPAND["补全引用父消息和完整话题"]
+        EXPAND["交替补全引用父消息与关联话题"]
+        MORE_CONTEXT{"发现未尝试的引用或话题？"}
+        RAW_CHECKPOINT["保存 raw_messages.json 和 fetch_metadata.json"]
         ASSEMBLE["去重、排序并按关键词组装上下文"]
-        CHECKPOINT["持久化消息 checkpoint 和缺失上下文记录"]
+        CHECKPOINT["保存 messages.json"]
         PREVIEW["预览消息、图片、视频、文件和缺失上下文数量"]
         CONFIRM{"用户确认只读诊断？"}
         CANCEL["标记 case 为 cancelled，不调用模型"]
@@ -132,10 +139,10 @@ flowchart TD
 
     subgraph DIAGNOSIS["单次 Codex 只读诊断"]
         APP["启动 CLI 专属 codex app-server --stdio"]
-        DISCOVER["调用 skills/list，确认 Codex 发现并启用指定 Skill"]
+        DISCOVER["若配置 Skill，调用 skills/list 验证发现与启用状态"]
         SANDBOX["创建 read-only thread，禁止审批、写文件和外部副作用"]
-        MCP["注册必需的 understand_video MCP 工具"]
-        TURN["以原生 Skill 输入启动一个 turn：聊天、附件、视频映射和仓库"]
+        MCP["启动时配置必需的 understand_video MCP 工具"]
+        TURN["启动一个 turn：可选 Skill、聊天、附件、视频映射和仓库"]
         SEARCH["Codex 搜索代码、Git 历史并整理证据"]
         NEED_VIDEO{"相关证据包含视频？"}
         VIDEO_TOOL["Codex 调用 understand_video"]
@@ -151,9 +158,10 @@ flowchart TD
         COMPLETE["标记 case 为 completed"]
         FAIL["保存 failure.json 并标记失败阶段"]
         NO_RETRY["不自动重试"]
-        RESUME{"用户显式执行 resume case-id？"}
+        RESUME(["用户显式执行 resume case-id"])
         RESTORE["读取 checkpoint，仅从失败阶段及后续阶段继续"]
         REENTER["重新进入记录的失败阶段"]
+        FETCH_METADATA{"存在 fetch_metadata.json？"}
     end
 
     subgraph CLEANUP["所有终态的资源清理"]
@@ -174,7 +182,9 @@ flowchart TD
     SKILL -- "是或未配置 Skill" --> RESOLVE --> CHOOSE
     CHOOSE -- "是" --> SELECT --> FETCH
     CHOOSE -- "否，唯一候选" --> FETCH
-    FETCH --> EXPAND --> ASSEMBLE --> CHECKPOINT --> PREVIEW --> CONFIRM
+    FETCH --> EXPAND --> MORE_CONTEXT
+    MORE_CONTEXT -- "是" --> EXPAND
+    MORE_CONTEXT -- "否" --> RAW_CHECKPOINT --> ASSEMBLE --> CHECKPOINT --> PREVIEW --> CONFIRM
     CONFIRM -- "否" --> CANCEL --> TERMINATE
     CONFIRM -- "是" --> MATERIALIZE
 
@@ -189,7 +199,7 @@ flowchart TD
     PARTIAL_CONFIRM -- "是" --> APP
     PARTIAL -- "否" --> APP
 
-    APP --> DISCOVER --> SANDBOX --> MCP --> TURN --> SEARCH --> NEED_VIDEO
+    APP --> MCP --> DISCOVER --> SANDBOX --> TURN --> SEARCH --> NEED_VIDEO
     NEED_VIDEO -- "是" --> VIDEO_TOOL --> UPLOAD --> UNDERSTAND --> DELETE_REMOTE --> SEARCH
     NEED_VIDEO -- "否或视频分析完成" --> FINAL --> VALID
     VALID -- "是" --> SAVE --> COMPLETE --> TERMINATE
@@ -197,14 +207,16 @@ flowchart TD
     FETCH -. "API、分页或上下文失败" .-> FAIL
     MATERIALIZE -. "不可继续的附件失败" .-> FAIL
     APP -. "初始化、MCP、模型或超时失败" .-> FAIL
-    FAIL --> NO_RETRY --> RESUME
-    RESUME -- "是" --> RESTORE --> REENTER
+    FAIL --> NO_RETRY --> TERMINATE
+    RESUME --> RESTORE --> REENTER
     REENTER -. "会话定位失败" .-> RESOLVE
     REENTER -. "消息拉取失败" .-> FETCH
-    REENTER -. "上下文组装失败" .-> ASSEMBLE
+    REENTER -. "上下文组装失败" .-> FETCH_METADATA
+    FETCH_METADATA -- "是：沿用原始消息和缺失记录" --> ASSEMBLE
+    FETCH_METADATA -- "否：提示并重新拉取" --> FETCH
+    REENTER -. "等待用户确认时失败" .-> PREVIEW
     REENTER -. "附件准备失败" .-> MATERIALIZE
     REENTER -. "Codex 诊断失败：重新下载并确认缺失附件" .-> MATERIALIZE
-    RESUME -- "否" --> TERMINATE
 
     TERMINATE --> WAIT
     WAIT -- "是" --> MCP_CLOSE
