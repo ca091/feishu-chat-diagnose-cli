@@ -18,7 +18,7 @@ from .errors import ConfigurationError
 from .feishu import FeishuGateway
 from .initialization import initialize
 from .lark_runner import LarkCliRunner
-from .models import ConversationCandidate
+from .models import CaseState, ConversationCandidate
 from .orchestrator import AnalyzeRequest, DiagnosisOrchestrator
 from .progress import ProgressEvent, ProgressSink, redact_secrets, sanitize_message
 from .time_range import resolve_time_range
@@ -105,14 +105,11 @@ def analyze(
     )
     request = AnalyzeRequest(group_name=group, person_name=person, repo_alias=repo,
                              time_range=time_range, keyword=keyword, skill=skill)
-    state = build_runtime(settings, _render_progress).analyze(
+    runtime = build_runtime(settings, _render_progress)
+    state = runtime.analyze(
         request, _choose_candidate, _confirm
     )
-    typer.echo(f"case: {state.case_id}\nstage: {state.stage}")
-    if state.error:
-        typer.echo(f"error: {state.error}", err=True)
-    if state.stage == "failed":
-        raise typer.Exit(code=1)
+    _display_result(runtime.store, state)
 
 
 @app.command("list")
@@ -144,11 +141,26 @@ def resume(case_id: str, config: Annotated[Path | None, typer.Option("--config")
     before = runtime.store.read_state(case_id)
     typer.echo(f"Resuming failed stage: {before.failed_stage}")
     state = runtime.resume(case_id, choose=_choose_candidate, confirm=_confirm)
+    _display_result(runtime.store, state)
+
+
+def _display_result(store: CaseStore, state: CaseState) -> None:
     typer.echo(f"case: {state.case_id}\nstage: {state.stage}")
+    if state.stage == "failed" and state.failed_stage:
+        typer.echo(f"failed_stage: {state.failed_stage}", err=True)
     if state.error:
         typer.echo(f"error: {state.error}", err=True)
     if state.stage == "failed":
         raise typer.Exit(code=1)
+    if state.stage == "completed":
+        report_path = store.case_dir(state.case_id) / "report.md"
+        try:
+            report = report_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            typer.echo(f"error: 无法读取诊断报告 {report_path}：{error}", err=True)
+            raise typer.Exit(code=1) from None
+        typer.echo()
+        typer.echo(report, nl=not report.endswith("\n"))
 
 
 @app.command("video-check")

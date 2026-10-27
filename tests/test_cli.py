@@ -160,6 +160,10 @@ def test_case_commands_share_global_storage_from_any_directory(
 def test_diagnosis_commands_signal_failure_to_shell(tmp_path, mocker, command, stage, error, exit_code) -> None:
     store = CaseStore(tmp_path / "cases")
     state = store.create({"repo_alias": "demo"}).model_copy(update={"stage": stage, "error": error})
+    report = "# 诊断报告\n\n## 结论\n\n- 检查 `src/example.py` 中的 [配置]。\n"
+    store.write_text(state.case_id, "report.md", report)
+    if stage == "failed":
+        state = state.model_copy(update={"failed_stage": "diagnosing_repository"})
     runtime = mocker.Mock(store=store)
     runtime.analyze.return_value = state
     runtime.resume.return_value = state
@@ -173,4 +177,28 @@ def test_diagnosis_commands_signal_failure_to_shell(tmp_path, mocker, command, s
     assert result.exit_code == exit_code, result.output
     assert f"stage: {stage}" in result.output
     if error:
-        assert f"error: {error}" in result.output
+        assert f"error: {error}" in result.stderr
+    if stage == "completed":
+        assert report in result.stdout
+    else:
+        assert report not in result.output
+    if stage == "failed":
+        assert "failed_stage: diagnosing_repository" in result.stderr
+
+
+@pytest.mark.parametrize("report_content", [None, b"\xff"])
+def test_analyze_reports_unreadable_report(tmp_path, mocker, report_content) -> None:
+    store = CaseStore(tmp_path / "cases")
+    state = store.create({"repo_alias": "demo"}).model_copy(update={"stage": "completed"})
+    if report_content is not None:
+        (store.case_dir(state.case_id) / "report.md").write_bytes(report_content)
+    runtime = mocker.Mock(store=store)
+    runtime.analyze.return_value = state
+    mocker.patch("feishu_chat_diagnose.cli.load_settings", return_value=Settings())
+    mocker.patch("feishu_chat_diagnose.cli.build_runtime", return_value=runtime)
+    result = CliRunner().invoke(app, ["analyze", "--group", "Test", "--repo", "demo"])
+
+    assert result.exit_code == 1
+    assert "无法读取诊断报告" in result.stderr
+    assert str(store.case_dir(state.case_id) / "report.md") in result.stderr
+    assert "Traceback" not in result.output
