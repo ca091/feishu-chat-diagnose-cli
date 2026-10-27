@@ -3,7 +3,7 @@ from typer.testing import CliRunner
 
 from feishu_chat_diagnose.case_store import CaseStore
 from feishu_chat_diagnose.config import Settings
-from feishu_chat_diagnose.cli import REQUIRED_FEISHU_SCOPES, _render_progress, app
+from feishu_chat_diagnose.cli import REQUIRED_FEISHU_SCOPES, _render_progress, app, build_runtime
 from feishu_chat_diagnose.progress import ProgressEvent
 
 
@@ -16,7 +16,7 @@ def test_analyze_rejects_group_and_person_together() -> None:
 def test_help_lists_operator_commands() -> None:
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
-    for command in ("init", "doctor", "analyze", "list", "show", "resume"):
+    for command in ("init", "doctor", "video-check", "analyze", "list", "show", "resume"):
         assert command in result.output
 
 
@@ -35,13 +35,42 @@ def test_doctor_reports_missing_video_key_without_traceback(monkeypatch) -> None
     monkeypatch.setattr("feishu_chat_diagnose.cli.load_settings", lambda config: Settings())
     monkeypatch.setattr("feishu_chat_diagnose.cli.subprocess.run", lambda *args, **kwargs: None)
     monkeypatch.setattr("feishu_chat_diagnose.cli.LarkCliRunner.run", lambda *args, **kwargs: {})
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
 
     result = CliRunner().invoke(app, ["doctor"])
 
     assert result.exit_code == 1
-    assert "GEMINI_API_KEY is not set" in result.output
+    assert "DASHSCOPE_API_KEY or video_tool.api_key" in result.output
     assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("environment_key", [None, "environment-video-key"])
+def test_doctor_and_runtime_forward_resolved_video_credentials(
+    tmp_path, monkeypatch, mocker, environment_key
+) -> None:
+    settings = Settings(video_tool={"api_key": "configured-video-key", "base_url": "https://gateway.example/compatible-mode/v1"})
+    if environment_key:
+        monkeypatch.setenv("DASHSCOPE_API_KEY", environment_key)
+    else:
+        monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    mocker.patch("feishu_chat_diagnose.cli.load_settings", return_value=settings)
+    mocker.patch("feishu_chat_diagnose.cli.subprocess.run")
+    mocker.patch("feishu_chat_diagnose.cli.LarkCliRunner.run", return_value={})
+    launch = mocker.patch("feishu_chat_diagnose.cli.CodexAppServerDiagnosis.launch")
+
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "video provider credentials: present" in result.output
+    launch.return_value.close.assert_called_once()
+    assert "configured-video-key" not in result.output
+    assert "environment-video-key" not in result.output
+    doctor_options = launch.call_args.kwargs
+
+    build_runtime(settings).codex_factory(tmp_path)
+    for options in (doctor_options, launch.call_args.kwargs):
+        assert options["video_api_key"] == (environment_key or "configured-video-key")
+        assert options["video_model"] == "qwen3-vl-plus"
+        assert options["video_base_url"] == "https://gateway.example/compatible-mode/v1"
 
 
 def test_progress_renderer_flushes_user_facing_message(capsys) -> None:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -18,7 +17,7 @@ from .models import (
     DiagnosisSkill, FetchMetadata, MessageBundle, NormalizedMessage, TimeRange,
 )
 from .report import render_report
-from .progress import CaseProgressLogger, ProgressSink
+from .progress import CaseProgressLogger, ProgressSink, redact_secrets
 
 
 class AnalyzeRequest(BaseModel):
@@ -326,11 +325,12 @@ class DiagnosisOrchestrator:
         state = self.store.read_state(case_id)
         stage = state.stage if state.stage != "failed" else state.failed_stage
         assert stage is not None
-        message = _redact(str(error))
+        secrets = (self.settings.video_tool.api_key.get_secret_value(),)
+        message = redact_secrets(str(error), secrets)
         self._logger(case_id).error("case.failed", f"诊断失败，阶段：{stage}")
         self.store.write_json(case_id, "failure.json", {"stage": stage, "error": message})
         if isinstance(error, ModelOutputError):
-            self.store.write_text(case_id, "model-response.txt", _redact(error.raw_response))
+            self.store.write_text(case_id, "model-response.txt", redact_secrets(error.raw_response, secrets))
         return self.store.fail(case_id, stage, message)
 
     @staticmethod
@@ -351,7 +351,10 @@ class DiagnosisOrchestrator:
     def _logger(self, case_id: str) -> CaseProgressLogger:
         logger = self._loggers.get(case_id)
         if logger is None:
-            logger = CaseProgressLogger(self.store, case_id, self.progress_sink)
+            logger = CaseProgressLogger(
+                self.store, case_id, self.progress_sink,
+                secrets=(self.settings.video_tool.api_key.get_secret_value(),),
+            )
             self._loggers[case_id] = logger
         return logger
 
@@ -359,13 +362,6 @@ class DiagnosisOrchestrator:
 def _attachments(bundle: MessageBundle) -> list[AttachmentRef]:
     return [attachment for message in bundle.messages for attachment in message.attachments
             if attachment.kind != "unsupported"]
-
-
-def _redact(value: str) -> str:
-    for name, secret in os.environ.items():
-        if secret and any(token in name.upper() for token in ("TOKEN", "SECRET", "API_KEY", "PASSWORD")):
-            value = value.replace(secret, "[REDACTED]")
-    return value
 
 
 def _choose_single(candidates: list[ConversationCandidate]) -> ConversationCandidate:

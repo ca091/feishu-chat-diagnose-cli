@@ -1,24 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
 from .case_store import CaseStore
 from .codex_app_server import CodexAppServerDiagnosis
-from .config import Settings, load_settings
+from .config import Settings, load_settings, load_video_tool_settings
 from .errors import ConfigurationError
 from .feishu import FeishuGateway
 from .initialization import initialize
 from .lark_runner import LarkCliRunner
 from .models import ConversationCandidate
 from .orchestrator import AnalyzeRequest, DiagnosisOrchestrator
-from .progress import ProgressEvent, ProgressSink
+from .progress import ProgressEvent, ProgressSink, redact_secrets, sanitize_message
 from .time_range import resolve_time_range
+from .video_check import VideoInputError, check_video
 
 app = typer.Typer(no_args_is_help=True, help="Diagnose Feishu discussions against a local repository.")
 REQUIRED_FEISHU_SCOPES = (
@@ -54,7 +58,7 @@ def init() -> None:
     else:
         typer.echo("已生成带注释的配置模板。")
     typer.echo(f"配置文件：{result.config_path}\n默认案例目录：{result.case_directory}")
-    typer.echo("请编辑配置中的仓库、Skill 和视频模型，完成授权并设置 GEMINI_API_KEY 后运行 feishu-diagnose doctor。")
+    typer.echo("请编辑配置中的仓库、Skill 和视频模型，完成授权并填写 video_tool.base_url、api_key（或设置 DASHSCOPE_API_KEY） 后运行 feishu-diagnose doctor。")
     if os.environ.get("FEISHU_DIAGNOSE_CONFIG"):
         typer.echo("提示：FEISHU_DIAGNOSE_CONFIG 已设置，普通命令仍优先使用它；init 始终初始化全局位置。")
 
@@ -69,6 +73,8 @@ def build_runtime(
         return CodexAppServerDiagnosis.launch(
             media_root, codex_bin=settings.codex.bin, model=settings.codex.model,
             video_model=settings.video_tool.model,
+            video_api_key=settings.video_tool.resolve_api_key(),
+            video_base_url=settings.video_tool.base_url,
             video_timeout_seconds=settings.video_tool.timeout_seconds,
             timeout_seconds=settings.codex.timeout_seconds,
         )
@@ -145,6 +151,59 @@ def resume(case_id: str, config: Annotated[Path | None, typer.Option("--config")
         raise typer.Exit(code=1)
 
 
+@app.command("video-check")
+def video_check(
+    video: Annotated[Path, typer.Argument(help="Local video to upload and understand")],
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print only the result JSON to stdout")] = False,
+) -> None:
+    """通过视频 MCP 和阿里模型检查本地视频；无需 Codex 或飞书。"""
+    secrets: tuple[str, ...] = ()
+    started = time.monotonic()
+
+    def progress(event: ProgressEvent) -> None:
+        _render_progress(ProgressEvent(event.level, event.name, sanitize_message(event.message, secrets)))
+
+    try:
+        settings = load_video_tool_settings(config)
+        secrets = (settings.api_key.get_secret_value(), settings.resolve_api_key())
+        result = asyncio.run(check_video(video, settings, progress))
+    except KeyboardInterrupt:
+        typer.echo("视频自检已中断", err=True)
+        raise typer.Exit(code=130) from None
+    except VideoInputError as error:
+        raise typer.BadParameter(sanitize_message(str(error), secrets), param_hint="VIDEO") from None
+    except Exception as error:
+        typer.echo(f"Error: {sanitize_message(str(error), secrets)[:1500]}", err=True)
+        raise typer.Exit(code=1) from None
+
+    # Redact individual strings before serializing so JSON escaping stays valid.
+    def redact_values(value: Any) -> Any:
+        if isinstance(value, str):
+            return redact_secrets(value, secrets)
+        if isinstance(value, dict):
+            return {key: redact_values(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redact_values(item) for item in value]
+        return value
+
+    payload = redact_values(result.model_dump(mode="json"))
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    typer.echo(f"视频自检通过（模型：{sanitize_message(settings.model, secrets)}，耗时：{time.monotonic() - started:.1f} 秒）")
+    typer.echo(f"\n摘要：{payload['summary']}")
+    typer.echo("\n时间点观察：")
+    for item in payload["observations"]:
+        typer.echo(f"- {item['timestamp']}：{item['observation']}")
+    if not payload["observations"]:
+        typer.echo("- 未返回具体时间点")
+    if payload["missing_information"]:
+        typer.echo("\n缺失信息：")
+        for item in payload["missing_information"]:
+            typer.echo(f"- {item}")
+
+
 @app.command()
 def doctor(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
     settings = _load_settings(config)
@@ -166,17 +225,18 @@ def doctor(config: Annotated[Path | None, typer.Option("--config")] = None) -> N
         " ".join(REQUIRED_FEISHU_SCOPES), "--json",
     ])
     typer.echo("feishu authorization: ok")
-    if not os.environ.get("GEMINI_API_KEY"):
-        typer.echo("Error: GEMINI_API_KEY is not set", err=True)
-        raise typer.Exit(code=1)
-    if not settings.video_tool.model:
-        typer.echo("Error: video_tool.model is not configured", err=True)
-        raise typer.Exit(code=1)
+    try:
+        settings.video_tool.validate_runtime()
+    except ConfigurationError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from None
     typer.echo("video provider credentials: present")
     with tempfile.TemporaryDirectory(prefix="feishu-doctor-") as directory:
         codex = CodexAppServerDiagnosis.launch(
             Path(directory), codex_bin=settings.codex.bin, model=settings.codex.model,
             video_model=settings.video_tool.model,
+            video_api_key=settings.video_tool.resolve_api_key(),
+            video_base_url=settings.video_tool.base_url,
             video_timeout_seconds=settings.video_tool.timeout_seconds,
             timeout_seconds=settings.codex.timeout_seconds,
         )

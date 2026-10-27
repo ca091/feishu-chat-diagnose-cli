@@ -4,8 +4,10 @@ import os
 from pathlib import Path
 import re
 import tomllib
+from typing import Any
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from .errors import ConfigurationError
 from .models import DiagnosisSkill, RepositorySettings
@@ -40,12 +42,57 @@ class CodexSettings(BaseModel):
 
 
 class VideoToolSettings(BaseModel):
-    provider: str = "gemini"
-    model: str = ""
-    timeout_seconds: float = 300.0
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    provider: str = "dashscope"
+    model: str = "qwen3-vl-plus"
+    base_url: str = ""
+    api_key: SecretStr = SecretStr("")
+    timeout_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+
+    def resolve_api_key(self) -> str:
+        return os.environ.get("DASHSCOPE_API_KEY") or self.api_key.get_secret_value()
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        if value != "dashscope":
+            raise ValueError(
+                "video_tool.provider must be dashscope; migrate legacy Gemini settings: "
+                "set provider, model, base_url and a new DashScope/gateway api_key"
+            )
+        return value
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if not value:
+            return value
+        try:
+            url = urlsplit(value)
+            valid = (
+                url.scheme in {"https", "http"} and url.hostname and url.port != 0
+                and not url.username and not url.password and not url.query and not url.fragment
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("video_tool.base_url must be an HTTP(S) API base URL without credentials or query")
+        return value
+
+    def validate_runtime(self) -> None:
+        if not self.resolve_api_key().strip():
+            raise ConfigurationError("Set DASHSCOPE_API_KEY or video_tool.api_key in config.toml")
+        if not self.model.strip():
+            raise ConfigurationError("video_tool.model is not configured")
+        if not self.base_url:
+            raise ConfigurationError("video_tool.base_url is not configured; set the OpenAI-compatible API base URL")
 
 
 class Settings(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     defaults: DefaultsSettings = Field(default_factory=DefaultsSettings)
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     codex: CodexSettings = Field(default_factory=CodexSettings)
@@ -115,7 +162,7 @@ def normalize_paths(settings: Settings, base: Path) -> Settings:
     return settings
 
 
-def load_settings(path: Path | None = None) -> Settings:
+def _read_config(path: Path | None) -> tuple[Path, dict[str, Any]]:
     config_path = resolve_config_path(path)
     if not config_path.exists():
         raise ConfigurationError(
@@ -124,8 +171,26 @@ def load_settings(path: Path | None = None) -> Settings:
         )
     try:
         payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        settings = normalize_paths(Settings.model_validate(payload), config_path.parent)
     except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:
+        raise ConfigurationError(f"Invalid configuration: {exc}") from exc
+    return config_path, payload
+
+
+def load_video_tool_settings(path: Path | None = None) -> VideoToolSettings:
+    _, payload = _read_config(path)
+    try:
+        settings = VideoToolSettings.model_validate(payload.get("video_tool", {}))
+    except ValueError as exc:
+        raise ConfigurationError(f"Invalid video configuration: {exc}") from exc
+    settings.validate_runtime()
+    return settings
+
+
+def load_settings(path: Path | None = None) -> Settings:
+    config_path, payload = _read_config(path)
+    try:
+        settings = normalize_paths(Settings.model_validate(payload), config_path.parent)
+    except ValueError as exc:
         raise ConfigurationError(f"Invalid configuration: {exc}") from exc
     for alias in settings.repositories:
         settings.repository(alias)

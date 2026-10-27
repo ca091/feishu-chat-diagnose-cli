@@ -63,13 +63,26 @@ im:message.group_msg:get_as_user im:message.p2p_msg:get_as_user
 contact:user.base:readonly
 ```
 
-视频理解需要在环境中设置 `GEMINI_API_KEY`，不要将值写入配置或提交到 Git。
+视频理解使用阿里模型，默认 `qwen3-vl-plus`（关闭深度思考）；需开通对应模型并按所用服务计费。在全局配置 `~/.feishu-diagnose/config.toml` 中填写自己的 Key：
+
+```toml
+[video_tool]
+provider = "dashscope"
+model = "qwen3-vl-plus"
+base_url = "https://你的业务空间和地域地址/compatible-mode/v1"
+api_key = "对应服务的 API Key"
+timeout_seconds = 300
+```
+
+Base URL 请从百炼控制台或网关提供方获取，不能混用 Coding Plan 地址和 Key。模型必须在所用服务开放。旧 Gemini 配置需修改 provider、model、base_url 并更换 API Key；不会自动沿用 Gemini Key。
+
+也可设置环境变量 `DASHSCOPE_API_KEY`；非空环境变量优先于配置中的 `api_key`。已有配置不会被 `init` 覆盖，请直接补充以上字段。Key 通过子进程环境传给专属视频 MCP，并用于向 base_url 发送 API 请求，不放入命令行参数或诊断提示；执行日志与失败记录会脱敏。请将全局配置权限设为仅本人可读写（`chmod 600 ~/.feishu-diagnose/config.toml`），不要提交含 Key 的配置。
 
 ## 使用
 
 ```bash
-export GEMINI_API_KEY="你的 Gemini API Key"
 feishu-diagnose doctor
+feishu-diagnose video-check /path/to/test.mp4
 feishu-diagnose analyze --group "示例群" --repo demo-project --since 2h
 feishu-diagnose analyze --group "示例群" --repo demo-project --skill project-bugfix --since 2h
 feishu-diagnose analyze --group "示例群" --repo demo-project --keyword "导出" --since 2h
@@ -79,6 +92,32 @@ feishu-diagnose list
 feishu-diagnose show <case-id>
 feishu-diagnose resume <case-id>
 ```
+
+### 独立验证视频工具
+
+`video-check` 会把指定视频以 Base64 发送到配置的兼容接口，通过项目现有的视频 MCP 调用 `understand_video`，输出中文摘要、带时间点的观察及缺失信息。无需启动 Codex、登录飞书或配置仓库与 Skill，也不创建 case。
+
+```bash
+feishu-diagnose video-check /path/to/test.mp4
+feishu-diagnose video-check /path/to/test.mp4 --json
+feishu-diagnose video-check /path/to/test.mp4 --config /path/to/config.toml
+```
+
+命令仅校验 `[video_tool]`，配置路径和 Key 优先级与其他命令相同。输入须为可读、非空的普通文件，支持 MP4、M4V、MOV、AVI、MKV、FLV、WMV 和 WebM；内容是否有效由服务判断。Base64 编码后须小于 10 MB（原文件约小于 7.5 MB），超限在请求前提示压缩；建议使用内容已知且至少 2 秒的短 MP4。原文件保持不变，调用使用的临时副本会在成功、失败或中断后清理。本工具不创建独立的远端文件资源；服务端对请求内容的保存策略以服务提供方约定为准。当前兼容网关的原生上传能力未经确认，暂不支持 100 MB 视频，不自动压缩或本地抽帧。此视觉模型不理解视频音轨。
+
+MCP 初始化及工具发现限时 30 秒，工具调用使用 `video_tool.timeout_seconds`，须为有限正数，默认 300 秒。HTTP 请求也显式使用此超时，工具端和命令端均限制调用总时长，不自动重试。终端会显示检查编码、发送视频并请求模型理解、校验结果三个阶段；上传与生成共用一个 HTTP 请求，不能独立观测服务端进度。等待期间每 10 秒显示当前阶段及已等待时长，进度通知不会延长调用总时限。超时错误会保留最近阶段，便于定位。同一诊断内，同一来源视频的并发调用只发送一次请求；超时或取消会关闭本地 HTTP 请求并缓存失败，避免再次调用重复发送。显式 `resume` 会创建新的视频 MCP，允许重新诊断。关闭连接不代表服务端已经停止处理或撤销计费。
+
+进度与错误写入 stderr，默认结果以文本写入 stdout；`--json` 时 stdout 只包含 `VideoToolResult` JSON（`source_message_id` 固定为 `video-check`），失败时为空。参数错误、执行失败、用户中断的退出码分别为 `2`、`1`、`130`，成功为 `0`。输出会对 Key 脱敏，不保存原始模型响应。
+
+| 命令 | 验证范围 |
+| --- | --- |
+| `doctor` | 配置、凭据是否存在、飞书授权及 Codex app-server 初始化；不实际调用视频模型 |
+| `video-check` | 视频 MCP 启动、工具发现、视频发送、阿里模型理解及结果结构校验 |
+| 含视频的 `analyze` | 飞书下载、Codex 调用视频工具及仓库诊断的完整链路 |
+
+自检成功表示工具调用完成且结果通过结构校验，仍需对照录屏确认摘要和时间点是否准确。
+
+### 诊断与恢复
 
 `analyze` 会先显示消息、图片、视频和文件数量，默认不继续；附件下载不完整时还会进行第二次确认。模型输出不符合 Schema、Codex 失败或视频工具失败时都不会自动重试，只有显式执行 `resume` 才会再次启动诊断。
 
@@ -229,10 +268,10 @@ flowchart TD
 
 ## 数据与边界
 
-case 默认保存在 `~/.feishu-diagnose/cases/<case-id>/`，其中可能包含私聊正文，请勿提交或公开分享。图片、视频和普通附件只存在于运行期临时目录，结束后删除。Gemini 仅作为 Codex 可调用的原始视频理解工具，最终问题归因和仓库分析只由同一个 Codex turn 完成。
+case 默认保存在 `~/.feishu-diagnose/cases/<case-id>/`，其中可能包含私聊正文，请勿提交或公开分享。图片、视频和普通附件只存在于运行期临时目录，结束后删除。诊断时，阿里模型作为 Codex 可调用的原始视频理解工具，最终问题归因和仓库分析只由同一个 Codex turn 完成；`video-check` 则独立验证视频工具，不进行仓库归因。
 
 首版不提供机器人、消息监听、飞书回复、代码修改、提交或推送，也没有自动重试。
 
 ## 手工冒烟测试
 
-准备一个测试群，发送一段问题文本、一张截图和一个 MP4；将对应测试仓库加入配置。先运行 `doctor`，再用较短的 `--since` 执行 `analyze`。确认报告包含聊天事实、视频时间点和仓库代码证据，并检查 case 目录中没有残留图片或视频。
+先用一段内容已知的短录屏运行 `video-check`，对照检查摘要与时间点；用 `--json` 确认结果可解析。然后准备一个测试群，发送一段问题文本、一张截图和一个 MP4；将对应测试仓库加入配置。运行 `doctor`，再用较短的 `--since` 执行 `analyze`。确认报告包含聊天事实、视频时间点和仓库代码证据，并检查 case 目录中没有残留图片或视频。

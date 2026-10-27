@@ -31,6 +31,18 @@ def test_progress_redacts_environment_secrets(tmp_path: Path, monkeypatch) -> No
     assert "secret-value" not in events[0].message
 
 
+def test_progress_redacts_configured_secret_in_file_and_callback(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    store = CaseStore(tmp_path / "cases")
+    events = []
+    logger = CaseProgressLogger(store, "case-1", events.append, secrets=("configured-video-key",))
+    logger.error("codex.failed", "provider rejected configured-video-key")
+
+    output = (store.case_dir("case-1") / "execution.log").read_text(encoding="utf-8")
+    assert "configured-video-key" not in output
+    assert events[0].message == "provider rejected [REDACTED]"
+
+
 def test_append_failure_warns_once_without_raising(tmp_path: Path, mocker) -> None:
     store = CaseStore(tmp_path / "cases")
     mocker.patch.object(store, "append_text", side_effect=OSError("disk unavailable"))

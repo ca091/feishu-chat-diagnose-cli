@@ -7,6 +7,37 @@ from feishu_chat_diagnose.errors import ConfigurationError
 from feishu_chat_diagnose.models import RepositorySettings
 
 
+def test_video_key_is_loaded_and_masked(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    config = tmp_path / "config.toml"
+    config.write_text('[video_tool]\napi_key = "configured-video-key"\n', encoding="utf-8")
+    settings = load_settings(config)
+
+    assert settings.video_tool.resolve_api_key() == "configured-video-key"
+    assert settings.video_tool.model == "qwen3-vl-plus"
+    assert "configured-video-key" not in repr(settings)
+    assert "configured-video-key" not in settings.model_dump_json()
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "environment-video-key")
+    assert settings.video_tool.resolve_api_key() == "environment-video-key"
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "")
+    assert settings.video_tool.resolve_api_key() == "configured-video-key"
+
+
+@pytest.mark.parametrize("video_config", [
+    'api_key = ["invalid-secret-key"]',
+    'api_key = "invalid-secret-key"\ntimeout_seconds = "invalid-secret-key"',
+])
+def test_invalid_video_settings_do_not_echo_credentials(tmp_path, video_config) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(f"[video_tool]\n{video_config}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigurationError) as caught:
+        load_settings(config)
+    assert "invalid-secret-key" not in str(caught.value)
+    assert "Invalid configuration" in str(caught.value)
+
+
 def test_load_settings_resolves_allowlisted_repository(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -198,3 +229,39 @@ def test_skill_allows_symlinks_contained_in_repository(tmp_path) -> None:
     settings = Settings(repositories={"repo": RepositorySettings(path=repo, diagnosis_skill="bugfix")})
 
     assert settings.diagnosis_skill("repo").path == skill.resolve()
+
+
+def test_legacy_gemini_configuration_requires_explicit_migration(tmp_path, monkeypatch):
+    from feishu_chat_diagnose.config import VideoToolSettings, load_video_tool_settings
+
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "legacy-google-key")
+    assert VideoToolSettings().resolve_api_key() == ""
+    config = tmp_path / "legacy.toml"
+    config.write_text('[video_tool]\nprovider="gemini"\napi_key="legacy-google-key"\n')
+    for loader in (load_settings, load_video_tool_settings):
+        with pytest.raises(ConfigurationError, match="migrate legacy Gemini") as caught:
+            loader(config)
+        assert "legacy-google-key" not in str(caught.value)
+
+
+@pytest.mark.parametrize("base_url", [
+    "not-a-url", "ftp://gateway.example/v1", "https://user:private-key@gateway.example/v1",
+    "https://gateway.example/v1?api_key=private-key", "https://gateway.example/v1#private-key",
+    "https://gateway.example:invalid/v1", "https://gateway.example:0/v1",
+])
+def test_invalid_api_base_url_is_rejected_without_echoing_input(tmp_path, base_url):
+    config = tmp_path / "config.toml"
+    config.write_text(f'[video_tool]\nbase_url="{base_url}"\n')
+    with pytest.raises(ConfigurationError, match="video_tool.base_url") as caught:
+        load_settings(config)
+    assert "private-key" not in str(caught.value)
+
+
+def test_base_url_normalization_and_missing_runtime_url():
+    from feishu_chat_diagnose.config import VideoToolSettings
+
+    assert VideoToolSettings(base_url=" https://gateway.example/v1/// ").base_url == "https://gateway.example/v1"
+    settings = VideoToolSettings(api_key="fake-key")
+    with pytest.raises(ConfigurationError, match="base_url is not configured"):
+        settings.validate_runtime()

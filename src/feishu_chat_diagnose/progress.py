@@ -30,10 +30,13 @@ class CaseProgressLogger:
         store: CaseStore,
         case_id: str,
         sink: ProgressSink | None = None,
+        *,
+        secrets: tuple[str, ...] = (),
     ) -> None:
         self.store = store
         self.case_id = case_id
         self.sink = sink or (lambda event: None)
+        self.secrets = secrets
         self._file_enabled = True
         self._file_warning_sent = False
 
@@ -50,7 +53,7 @@ class CaseProgressLogger:
         self.emit(event.level, event.name, event.message)
 
     def emit(self, level: ProgressLevel, name: str, message: str) -> None:
-        event = ProgressEvent(level, name, sanitize_message(message))
+        event = ProgressEvent(level, name, sanitize_message(message, self.secrets))
         self.sink(event)
         if not self._file_enabled:
             return
@@ -73,16 +76,25 @@ class CaseProgressLogger:
                 )
 
 
-def sanitize_message(message: str) -> str:
+def redact_secrets(message: str, secrets: tuple[str, ...] = ()) -> str:
     value = re.sub(
         r"(?i)\bBearer\s+[A-Za-z0-9._~+\-/]+=*",
         "Bearer [REDACTED]",
         str(message),
     )
-    for name, secret in os.environ.items():
-        if secret and any(
+    environment_secrets = (
+        secret for name, secret in os.environ.items() if any(
             token in name.upper()
             for token in ("TOKEN", "SECRET", "API_KEY", "PASSWORD")
-        ):
+        )
+    )
+    for secret in sorted(set((*environment_secrets, *secrets)), key=len, reverse=True):
+        if secret:
             value = value.replace(secret, "[REDACTED]")
+
+    return value
+
+
+def sanitize_message(message: str, secrets: tuple[str, ...] = ()) -> str:
+    value = redact_secrets(message, secrets)
     return " ".join(value.splitlines()).strip()

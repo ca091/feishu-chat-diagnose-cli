@@ -17,6 +17,9 @@ src/feishu_chat_diagnose/orchestrator.py
 src/feishu_chat_diagnose/progress.py
 src/feishu_chat_diagnose/report.py
 src/feishu_chat_diagnose/time_range.py
+src/feishu_chat_diagnose/video_check.py
+src/feishu_chat_diagnose/video_environment.py
+src/feishu_chat_diagnose/video_input.py
 src/feishu_chat_diagnose/video_mcp.py
 src/feishu_chat_diagnose_cli.egg-info/PKG-INFO
 src/feishu_chat_diagnose_cli.egg-info/SOURCES.txt
@@ -37,4 +40,6 @@ tests/test_orchestrator.py
 tests/test_progress.py
 tests/test_report.py
 tests/test_time_range.py
+tests/test_video_check.py
+tests/test_video_lifecycle.py
 tests/test_video_mcp.py

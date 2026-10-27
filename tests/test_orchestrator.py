@@ -96,6 +96,42 @@ def test_fetch_failure_waits_for_explicit_resume(tmp_path: Path) -> None:
     assert "resume.started" in [event.name for event in events]
 
 
+def test_configured_key_is_redacted_from_case_artifacts_and_progress(tmp_path, monkeypatch) -> None:
+    from pydantic import SecretStr
+
+    from feishu_chat_diagnose.errors import ModelOutputError
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "environment-video-key")
+    events = []
+    orchestrator, request, _ = runtime(tmp_path, events)
+    orchestrator.settings.video_tool.api_key = SecretStr("configured-video-key")
+
+    class FailingCodex(FakeCodex):
+        def set_progress(self, progress):
+            self.progress = progress
+
+        def diagnose(self, *args):
+            from feishu_chat_diagnose.progress import ProgressEvent
+
+            detail = "configured-video-key and environment-video-key"
+            self.progress(ProgressEvent("ERROR", "video.failed", detail))
+            raise ModelOutputError(f"first line\n{detail}", detail)
+
+    orchestrator.codex_factory = lambda root: FailingCodex([])
+    state = orchestrator.analyze(request, lambda items: items[0], lambda preview: True)
+
+    assert state.stage == "failed"
+    for path in orchestrator.store.case_dir(state.case_id).iterdir():
+        text = path.read_text(encoding="utf-8")
+        assert "configured-video-key" not in text
+        assert "environment-video-key" not in text
+    assert "[REDACTED]" in state.error
+    assert "\n" in (orchestrator.store.case_dir(state.case_id) / "model-response.txt").read_text()
+    assert next(event for event in events if event.name == "video.failed").message == (
+        "[REDACTED] and [REDACTED]"
+    )
+
+
 def test_default_skill_is_passed_to_codex(tmp_path: Path) -> None:
     orchestrator, request, calls = runtime(tmp_path)
     repo = orchestrator.settings.repositories["repo"].path

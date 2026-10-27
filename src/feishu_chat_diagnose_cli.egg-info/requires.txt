@@ -1,4 +1,4 @@
-google-genai<2,>=1
+httpx<1,>=0.28
 mcp<2,>=1
 pydantic<3,>=2.10
 typer<1,>=0.16

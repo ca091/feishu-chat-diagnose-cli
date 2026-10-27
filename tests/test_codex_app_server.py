@@ -166,6 +166,42 @@ def test_process_argv_requires_video_mcp(tmp_path: Path) -> None:
     assert captured["kwargs"]["env"]["FEISHU_DIAGNOSE_MEDIA_ROOT"] == str(tmp_path.resolve())
 
 
+@pytest.mark.parametrize("environment_key", [None, "", "environment-video-key"])
+def test_launch_passes_key_only_via_child_environment(
+    tmp_path, monkeypatch, mocker, environment_key
+) -> None:
+    import os
+    import tomllib
+
+    if environment_key is None:
+        monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("DASHSCOPE_API_KEY", environment_key)
+    popen = mocker.patch("feishu_chat_diagnose.codex_app_server.subprocess.Popen")
+    mocker.patch("feishu_chat_diagnose.codex_app_server.StdioJsonRpcTransport")
+
+    CodexAppServerDiagnosis.launch(
+        tmp_path, video_model="qwen3-vl-plus", video_api_key="configured-video-key",
+        video_timeout_seconds=123, video_base_url="https://gateway.example/compatible-mode/v1",
+    )
+
+    argv = popen.call_args.args[0]
+    child_env = popen.call_args.kwargs["env"]
+    assert child_env["DASHSCOPE_API_KEY"] == (environment_key or "configured-video-key")
+    assert os.environ.get("DASHSCOPE_API_KEY") == environment_key
+    assert "configured-video-key" not in " ".join(argv)
+    assert "environment-video-key" not in " ".join(argv)
+    forwarding = tomllib.loads(next(arg for arg in argv if ".env_vars=" in arg))
+    names = forwarding["mcp_servers"]["feishu_video"]["env_vars"]
+    assert {name: child_env[name] for name in names} == {
+        "DASHSCOPE_API_KEY": environment_key or "configured-video-key",
+        "FEISHU_DIAGNOSE_MEDIA_ROOT": str(tmp_path.resolve()),
+        "FEISHU_DIAGNOSE_VIDEO_MODEL": "qwen3-vl-plus",
+        "FEISHU_DIAGNOSE_VIDEO_BASE_URL": "https://gateway.example/compatible-mode/v1",
+        "FEISHU_DIAGNOSE_VIDEO_TIMEOUT": "123",
+    }
+
+
 def test_codex_progress_summarizes_events_without_raw_payload(tmp_path: Path, bundle) -> None:
     repo = tmp_path / "repo"; repo.mkdir()
     transport = FakeTransport()

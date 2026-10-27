@@ -16,6 +16,7 @@ from .models import (
     Sender,
     TimeRange,
 )
+from .video_input import VIDEO_MIME_TYPES
 
 
 class FeishuGateway:
@@ -345,13 +346,13 @@ def _inline_image_keys(content: Any) -> list[str]:
 
 
 def _parse_attachment(message_id: str, raw: dict[str, Any]) -> AttachmentRef:
-    media_type = str(raw.get("content_type", raw.get("media_type", raw.get("mime_type", ""))))
+    media_type = str(raw.get("content_type", raw.get("media_type", raw.get("mime_type", "")))).split(";", 1)[0].strip().lower()
     name = str(raw.get("name", raw.get("file_name", "")))
     resource_type = "image" if raw.get("type") == "image" or media_type.startswith("image/") else "file"
     suffix = Path(name).suffix.lower()
     if media_type.startswith("image/"):
         kind = "image"
-    elif media_type.startswith("video/") or suffix in {".mp4", ".mov", ".webm", ".mkv"}:
+    elif media_type.startswith("video/") or suffix in VIDEO_MIME_TYPES:
         kind = "video"
     elif media_type.startswith("text/") or suffix in {".txt", ".log", ".json", ".md"}:
         kind = "text"

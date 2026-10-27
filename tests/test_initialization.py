@@ -29,6 +29,8 @@ def test_init_creates_usable_template_without_external_calls(
     settings = load_settings()
     assert settings.repositories == {}
     assert settings.defaults.case_dir == diagnose_home / "cases"
+    assert settings.video_tool.model == "qwen3-vl-plus"
+    assert settings.video_tool.api_key.get_secret_value() == ""
 
 
 def test_init_preserves_existing_config_and_ignores_env(

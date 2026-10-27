@@ -7,6 +7,7 @@ from typing import Iterator, Protocol
 
 from .models import AttachmentRef
 from .progress import ProgressEvent, ProgressLevel, ProgressSink
+from .video_input import VIDEO_MIME_TYPES, video_suffix_for_media_type
 
 
 class AttachmentGateway(Protocol):
@@ -107,6 +108,9 @@ class AttachmentManager:
 
 def _safe_suffix(attachment: AttachmentRef) -> str:
     suffix = Path(attachment.name).suffix.lower()
+    if attachment.kind == "video" and suffix not in VIDEO_MIME_TYPES:
+        if inferred := video_suffix_for_media_type(attachment.media_type):
+            return inferred
     if suffix and len(suffix) <= 12 and suffix[1:].isalnum():
         return suffix
     return {
@@ -114,9 +118,6 @@ def _safe_suffix(attachment: AttachmentRef) -> str:
         "image/jpeg": ".jpg",
         "image/gif": ".gif",
         "image/webp": ".webp",
-        "video/mp4": ".mp4",
-        "video/quicktime": ".mov",
-        "video/webm": ".webm",
         "text/plain": ".txt",
         "application/json": ".json",
     }.get(attachment.media_type.lower(), ".bin")

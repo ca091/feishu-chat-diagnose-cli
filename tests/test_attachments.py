@@ -80,3 +80,41 @@ def test_attachment_progress_uses_only_ordinal_and_kind(tmp_path: Path) -> None:
     assert "private-file-key" not in text
     assert "private screenshot.png" not in text
     assert str(tmp_path) not in text
+
+
+@pytest.mark.parametrize("media_type,extension", [
+    ("video/mp4", ".mp4"), ("video/quicktime", ".mov"),
+    ("video/webm", ".webm"), ("video/x-matroska", ".mkv"),
+    ("video/x-msvideo", ".avi"), ("video/x-flv", ".flv"),
+    ("video/x-ms-wmv", ".wmv"),
+])
+@pytest.mark.parametrize("name", ["", "recording", "download.bin"])
+def test_video_mime_survives_parse_download_and_validation(tmp_path, media_type, extension, name):
+    from feishu_chat_diagnose.feishu import _parse_attachment
+    from feishu_chat_diagnose.video_input import validate_video
+
+    attachment = _parse_attachment("om_video", {
+        "file_key": "video-key", "content_type": media_type, "name": name,
+    })
+    assert attachment.kind == "video"
+    with AttachmentManager(FakeGateway(), tmp_path, 1024).materialize([attachment]) as batch:
+        assert not batch.failed
+        path = batch.available[0].local_path
+        assert path.suffix == extension
+        assert validate_video(path) == path
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("extension", [".m4v", ".avi", ".flv", ".wmv"])
+def test_supported_video_suffix_without_mime_reaches_validation(tmp_path, extension):
+    from feishu_chat_diagnose.feishu import _parse_attachment
+    from feishu_chat_diagnose.video_input import validate_video
+
+    attachment = _parse_attachment("om_video", {
+        "file_key": "video-key", "name": "recording" + extension.upper(),
+        "content_type": "application/octet-stream",
+    })
+    assert attachment.kind == "video"
+    with AttachmentManager(FakeGateway(), tmp_path, 1024).materialize([attachment]) as batch:
+        path = batch.available[0].local_path
+        assert validate_video(path).suffix == extension

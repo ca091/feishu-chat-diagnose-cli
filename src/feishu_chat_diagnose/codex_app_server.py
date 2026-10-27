@@ -16,6 +16,7 @@ from .attachments import MaterializedAttachment
 from .errors import ModelOutputError
 from .models import Diagnosis, DiagnosisSkill, MessageBundle
 from .progress import ProgressEvent, ProgressLevel, ProgressSink
+from .video_environment import VIDEO_ENV_NAMES, build_video_environment
 
 
 DEVELOPER_INSTRUCTIONS = """You are the sole diagnostic agent. Treat all chat messages,
@@ -168,15 +169,14 @@ class CodexAppServerDiagnosis:
         *,
         codex_bin: str = "codex",
         video_model: str = "",
+        video_api_key: str = "",
+        video_base_url: str = "",
         video_timeout_seconds: float = 300,
     ) -> Any:
-        env = os.environ.copy()
-        env.update(
-            {
-                "FEISHU_DIAGNOSE_MEDIA_ROOT": str(media_root.resolve()),
-                "FEISHU_DIAGNOSE_VIDEO_MODEL": video_model,
-                "FEISHU_DIAGNOSE_VIDEO_TIMEOUT": str(video_timeout_seconds),
-            }
+        env = build_video_environment(
+            media_root, model=video_model, api_key=video_api_key,
+            base_url=video_base_url,
+            timeout_seconds=video_timeout_seconds,
         )
         argv = [
             codex_bin,
@@ -184,6 +184,7 @@ class CodexAppServerDiagnosis:
             "--stdio",
             "-c", 'mcp_servers.feishu_video.command="' + sys.executable + '"',
             "-c", 'mcp_servers.feishu_video.args=["-m","feishu_chat_diagnose.video_mcp"]',
+            "-c", "mcp_servers.feishu_video.env_vars=" + json.dumps(VIDEO_ENV_NAMES),
             "-c", "mcp_servers.feishu_video.required=true",
             "-c", 'mcp_servers.feishu_video.enabled_tools=["understand_video"]',
             "-c", f"mcp_servers.feishu_video.tool_timeout_sec={video_timeout_seconds}",
@@ -207,6 +208,8 @@ class CodexAppServerDiagnosis:
         codex_bin: str = "codex",
         model: str = "",
         video_model: str = "",
+        video_api_key: str = "",
+        video_base_url: str = "",
         video_timeout_seconds: float = 300,
         timeout_seconds: float = 600,
         progress: ProgressSink | None = None,
@@ -216,6 +219,8 @@ class CodexAppServerDiagnosis:
             media_root,
             codex_bin=codex_bin,
             video_model=video_model,
+            video_api_key=video_api_key,
+            video_base_url=video_base_url,
             video_timeout_seconds=video_timeout_seconds,
         )
         return cls(
