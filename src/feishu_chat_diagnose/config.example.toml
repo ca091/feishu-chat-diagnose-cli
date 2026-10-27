@@ -4,9 +4,11 @@
 [defaults]
 # 未传 --since 或 --start/--end 时使用的消息时间窗口。
 message_window = "2h"
-# 案例、checkpoint、报告与执行日志；默认 ~/.feishu-diagnose/cases/。
+# 案例根目录；默认 ~/.feishu-diagnose/cases/，init 可创建空目录。
+# 只有进入代码诊断阶段后才创建单个 case、checkpoint、报告或执行日志。
 case_dir = "cases"
-# 最终组装的消息数量上限（含引用与话题补全）；超限报错，不截断。
+# 最终诊断消息数量上限（含必要根消息与引用祖先）；超限报错，不截断。
+# 此限制不用于截断前置分类的候选消息。
 max_messages = 300
 # 单个文本附件最多读取的字节数（1 MiB）。
 max_text_attachment_bytes = 1048576
@@ -17,7 +19,7 @@ lark_cli_bin = "lark-cli"
 
 [codex]
 bin = "codex"
-# 留空使用 Codex 默认模型。
+# 前置分类、Skill 适用性评估和代码诊断共用此模型；留空使用 Codex 默认模型。
 model = ""
 # 等待下一条完整 Codex 响应或事件的超时秒数，不是整个诊断的总时限。
 timeout_seconds = 600
@@ -36,9 +38,11 @@ timeout_seconds = 300
 # 添加允许诊断的仓库，命令通过 --repo example 选择。
 # [repositories.example]
 # path = "/absolute/path/to/project"
-# description = "Example project"
+# 前置分类仅使用别名、此描述、聊天正文和消息关系；请写明项目职责和业务范围。
+# description = "文档编辑器，负责富文本编辑、文档导入与导出"
 # Skill 位于目标仓库的 .agents/skills/<name>/SKILL.md；符号链接不得越出仓库，
 # 且 SKILL.md 不得越出解析后的 skills 目录；留空则不指定。
+# 仅在需要代码分析后评估适用性；不适合或不明确时跳过，使用通用只读分析。
 # diagnosis_skill = "project-bugfix"
 # --skill 只允许选择本仓库默认 Skill 或以下白名单中的名称。
 # allowed_skills = ["canvas-bugfix", "performance-diagnosis"]

@@ -84,6 +84,9 @@ def materialized(tmp_path: Path) -> list[MaterializedAttachment]:
 
 def test_single_turn_is_read_only_and_contains_multimodal_context(tmp_path: Path, bundle) -> None:
     repo = tmp_path / "repo"; repo.mkdir()
+    context = bundle.messages[0].model_copy(update={"message_id": "context", "text": "Earlier background"})
+    bundle.messages.insert(0, context)
+    bundle.analysis_message_ids = ["om_1"]
     transport = FakeTransport()
     result = CodexAppServerDiagnosis(transport, model="codex-test").diagnose(repo, bundle, materialized(tmp_path))
     assert result.confidence == 82
@@ -92,6 +95,12 @@ def test_single_turn_is_read_only_and_contains_multimodal_context(tmp_path: Path
     assert turn["sandboxPolicy"] == {"type": "readOnly"}
     assert [item["type"] for item in turn["input"]] == ["text", "localImage"]
     assert "understand_video" in turn["input"][0]["text"] and "om_video" in turn["input"][0]["text"]
+    prompt = turn["input"][0]["text"]
+    transcript = json.loads(prompt.split("TRANSCRIPT_JSON:\n", 1)[1].split("\n\nTEXT_ATTACHMENTS_JSON:", 1)[0])
+    assert [(message["message_id"], message["role"]) for message in transcript] == [
+        ("context", "context_only"), ("om_1", "analysis_target"),
+    ]
+    assert "Do not diagnose separate topics in context_only messages" in prompt
     schema = turn["outputSchema"]
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == set(schema["properties"])

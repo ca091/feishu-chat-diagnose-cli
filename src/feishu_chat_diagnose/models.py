@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ConversationType = Literal["group", "p2p"]
 CaseStage = Literal[
@@ -86,6 +86,50 @@ class MessageBundle(BaseModel):
     time_range: TimeRange
     messages: list[NormalizedMessage]
     missing_message_ids: list[str] = Field(default_factory=list)
+    analysis_kind: Literal["bug", "code"] = "bug"
+    # Legacy cases have no triage scope and analyze all retained messages.
+    analysis_message_ids: list[str] | None = None
+
+
+class DiscussionTopic(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    kind: Literal["bug", "requirement", "design", "other", "unknown"]
+    summary: str = Field(min_length=1)
+    project_related: Literal["yes", "no", "unknown"]
+    needs_code: bool = Field(strict=True)
+    reason: str = Field(min_length=1)
+    message_ids: list[str] = Field(min_length=1)
+    missing_information: list[str]
+
+    @model_validator(mode="after")
+    def validate_code_decision(self) -> DiscussionTopic:
+        if self.needs_code and (self.project_related != "yes" or self.kind == "unknown"):
+            raise ValueError("Code analysis requires a known, project-related topic")
+        return self
+
+
+class DiscussionTriage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    topics: list[DiscussionTopic] = Field(min_length=1)
+
+    @property
+    def code_message_ids(self) -> set[str]:
+        return {message_id for topic in self.topics if topic.needs_code for message_id in topic.message_ids}
+
+
+class SkillAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    applicable: bool = Field(strict=True)
+    reason: str = Field(min_length=1)
+
+
+class TriageCheckpoint(BaseModel):
+    triage: DiscussionTriage
+    requested_skill: str
+    skill_assessment: SkillAssessment | None = None
 
 
 class VideoObservation(BaseModel):

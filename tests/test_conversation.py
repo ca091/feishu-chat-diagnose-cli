@@ -77,3 +77,15 @@ def test_quote_cycles_terminate(message_factory) -> None:
     ]
 
     assert ConversationAssembler(max_messages=2).assemble(messages, keyword="bug") == messages
+
+
+def test_explicit_seeds_keep_recursive_ancestors_without_thread_siblings(message_factory) -> None:
+    messages = [
+        message_factory("ancestor", "Earlier background"),
+        message_factory("root", "Thread background", reply_to_message_id="ancestor", minute=1),
+        message_factory("match", "Code question", thread_root_id="root", minute=2),
+        message_factory("sibling", "Lunch", thread_root_id="root", minute=3),
+    ]
+    assembler = ConversationAssembler(max_messages=3)
+    assert assembler.assemble(messages, seed_ids={"match"}) == messages[:3]
+    assert assembler.assemble(messages, seed_ids=set()) == []

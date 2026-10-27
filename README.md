@@ -1,6 +1,6 @@
 # Feishu Chat Diagnose CLI
 
-手动选择飞书群聊或私聊，拉取限定时间范围内的消息与多模态附件，再让 Codex 在明确指定的本地仓库中进行只读问题诊断。
+手动选择飞书群聊或私聊，先根据聊天正文判断讨论类型及是否需要代码分析。无需代码时直接输出总结和原因；需要时，再让 Codex 在指定的本地仓库中进行只读分析。
 
 ## 安装
 
@@ -21,12 +21,12 @@ feishu-diagnose init
 ```toml
 [repositories.demo-project]
 path = "/absolute/path/to/demo-project"
-description = "Demo project"
+description = "文档编辑器，负责富文本编辑、文档导入与导出"
 diagnosis_skill = "project-bugfix"
 allowed_skills = ["project-bugfix", "performance-optimization"]
 ```
 
-仓库只能通过别名选择，聊天内容不能改变仓库、Skill 或权限。Skill 路径中的符号链接解析后仍须位于该仓库内，且 Skill 文件不得越出解析后的 skills 目录。`diagnosis_skill` 可以留空；设置后将作为该仓库的默认诊断流程。
+仓库只能通过别名选择，聊天内容不能改变仓库、Skill 或权限。Skill 路径中的符号链接解析后仍须位于该仓库内，且 Skill 文件不得越出解析后的 skills 目录。`description` 用于前置判断，请说明项目职责和业务范围；判断时不会读取 README 或源代码。`diagnosis_skill` 可以留空；设置后会先评估是否适合当前代码分析话题。
 
 ### 全局配置与初始化
 
@@ -35,8 +35,8 @@ allowed_skills = ["project-bugfix", "performance-optimization"]
 ```text
 ~/.feishu-diagnose/
 ├── config.toml
-└── cases/
-    └── <case-id>/
+└── cases/             # init 可创建的空根目录
+    └── <case-id>/     # 仅进入代码诊断阶段后创建
 ```
 
 `init` 生成带注释的配置模板和案例目录，不调用外部服务；重复执行会保留已有全局配置。如果当前目录存在旧的 `config/config.toml` 且全局配置尚不存在，会自动迁移配置：保留注释及模型、Skill 等设置，将相对仓库和可执行文件路径按当前项目目录转换为绝对路径，并将 `case_dir` 改为 `cases`。原配置保留，旧案例不迁移。旧配置无效时会报错，不会用模板替代。
@@ -53,7 +53,15 @@ feishu-diagnose list --config /absolute/path/to/other-config.toml
 
 `uv tool install` 默认不读取项目的 `uv.lock`；上述导出约束的步骤让安装与测试使用相同的依赖版本，避免重新解析出需要额外编译环境的新版本。临时约束文件无需保留到项目中。
 
-源码或依赖更新后，重新导出约束并执行安装命令，添加 `--reinstall`。开发时在安装命令中增加 `--editable`，源码修改直接生效，依赖或入口变更仍需重新安装。仓库内开发与测试继续使用 `uv sync --python 3.12 --extra dev` 和 `uv run pytest`，也可运行 `uv run feishu-diagnose ...`。
+普通安装会保存源码副本，仓库中的修改不会自动更新全局 `feishu-diagnose`。源码或依赖更新后，在项目根目录重新安装：
+
+```bash
+diagnose_constraints="$(mktemp)"
+uv export --locked --no-dev --no-emit-project --no-hashes --output-file "$diagnose_constraints"
+uv tool install --python 3.12 --constraints "$diagnose_constraints" --reinstall .
+```
+
+开发时在安装命令中增加 `--editable`，源码修改直接生效，依赖或入口变更仍需重新安装。仓库内开发与测试继续使用 `uv sync --python 3.12 --extra dev` 和 `uv run pytest`，也可运行 `uv run feishu-diagnose ...` 使用当前源码。
 
 飞书访问使用当前用户身份，需要先完成 `lark-cli` 登录，并授权以下只读 scope：
 
@@ -119,19 +127,50 @@ MCP 初始化及工具发现限时 30 秒，工具调用使用 `video_tool.timeo
 
 ### 诊断与恢复
 
-`analyze` 会先显示消息、图片、视频和文件数量，默认不继续；附件下载不完整时还会进行第二次确认。模型输出不符合 Schema、Codex 失败或视频工具失败时都不会自动重试，只有显式执行 `resume` 才会再次启动诊断。
+`analyze` 查找会话并拉取消息后，自动调用一个独立、临时的 Codex 分类会话，仅提供项目别名、配置中的 `description`、聊天正文及引用/话题关系。该会话不读取仓库、附件或 Skill，没有命令、搜索和 MCP 等工具。分类、Skill 适用性评估和后续代码诊断使用独立会话，共用 `[codex]` 的模型、授权与超时配置。前置分类与 Skill 评估发生在诊断确认之前，会调用 Codex 模型。
+
+分类将聊天分为问题反馈、需求讨论、设计讨论、其他讨论和信息不足。只有明确关联项目且需要检查现有实现的话题才进入代码分析；需求和设计讨论也可以进入，不会强行套用 bug 归因。无关、无需代码或信息不足时，终端直接输出中文总结、跳过原因及待补充信息，不创建 case，不调用后续 Skill，不下载附件。此时不会校验本地仓库路径或 Skill 文件。
+
+混合话题会在终端展示全部总结，仅选择需要代码分析的话题及必要根消息、引用祖先，不会仅因处于同一线程就纳入其他回复。诊断输入会区分分析目标和仅供参考的背景消息。随后校验仓库、评估指定 Skill，并预览分析话题、Skill 决定以及消息和附件数量。用户确认后才下载附件；附件下载不完整时还会进行第二次确认。以上步骤均只使用内存和临时附件，不创建 case 或执行日志。仅在全部确认完成、实际进入代码诊断阶段时，才创建 case 并保存选定上下文和分流决定。
+
+首次执行 `analyze` 时，各种结果的处理如下：
+
+| 结果 | 退出码 | case 与执行日志 | 下一步 |
+| --- | --- | --- | --- |
+| 无消息，或会话查找、拉取、分类、校验、组装、Skill 评估失败，或附件准备异常中止 | `1` | 不创建，仅在终端输出错误 | 修正条件后重新执行 `analyze` |
+| 无需代码分析或信息不足 | `0` | 不创建，直接展示总结和原因 | 按提示补充背景或结束 |
+| 取消诊断确认或附件不完整确认 | `0` | 不创建，显示“已取消代码诊断；未创建 case。” | 需要时重新执行 `analyze` |
+| 代码诊断完成 | `0` | 保存检查点、日志和报告，终端展示 `report.md` | 使用 `show` 查看案例 |
+| 进入代码诊断后失败，含 Codex 启动失败 | `1` | 保存失败阶段、错误、检查点和日志 | 显式执行 `resume <case-id>` |
+
+无消息时会输出 `Error: No messages found in the selected time range`。未指定时间范围时，默认取 `defaults.message_window`（模板为 `2h`）；可扩大 `--since` 或指定 `--start/--end` 后重试。这里“不创建 case”指不新增 `<case-id>/` 及其中的文件；`init` 已创建的空 `cases/` 根目录可以存在。
+
+分类格式无效、隔离配置无法落实或分类意外请求工具时，会停止，不自动进入代码诊断。分类隔离已用 Codex 0.164.0 本地验证；旧版本不支持所需选项时请升级。`doctor` 仅检查配置、授权、凭据和 app-server 初始化，不验证分类隔离或实际模型响应。所有阶段均不自动重试。
+
+无需代码时的输出示例：
+
+```text
+聊天内容总结：
+
+1. 需求讨论：讨论下季度需求优先级和排期
+未进行代码诊断：当前仅讨论业务优先级，无需检查项目现有实现
+
+未进行代码诊断；未创建 case。
+```
 
 消息拉取会交替补全引用父消息和关联话题，直到没有尚未尝试的关联；话题新增消息的引用也会继续补全，因此上下文可能超出所选时间范围。同一次拉取中，每个引用目标和话题只补全一次（话题接口会分页），失败项会显示在缺失提示中。
 
 `--keyword` 按消息正文筛选，并保留关联引用链和话题。`defaults.max_messages` 限制最终组装的消息数；超限会报错，不会截断上下文。
 
-`resume` 只支持失败案例，从记录的失败阶段继续；已完成或已取消的案例需重新执行 `analyze`。恢复到附件准备或诊断阶段时会重新下载附件，下载不完整须再次确认，可继续使用可用附件或取消；临时文件在完成、失败或取消后清理。`analyze` 和 `resume` 完成后会在终端输出 case ID 和状态；成功时直接展示该 case 的 `report.md` 全文，失败时向标准错误输出失败阶段和错误信息。以 `stage: failed` 结束时返回退出码 `1`，正常完成或用户取消时返回 `0`；报告读取失败时提示文件路径并返回 `1`。
+`resume` 只支持失败案例，从记录的失败阶段继续；新 case 的首次失败阶段从代码诊断（含 Codex 启动）开始，前置失败和取消均没有 case。旧版本留下的会话查找、消息拉取、组装、确认或附件阶段案例仍可恢复；已完成或已取消的旧案例需重新执行 `analyze`。恢复到附件准备或诊断阶段时会重新下载附件，下载不完整须再次确认，可继续使用可用附件或取消；临时文件在完成、失败或取消后清理。进入代码分析流程的 `analyze` 和 `resume` 完成后会在终端输出 case ID 和状态；成功时直接展示该 case 的 `report.md` 全文，失败时向标准错误输出失败阶段和错误信息。以 `stage: failed` 结束时返回退出码 `1`，正常完成或用户取消时返回 `0`；报告读取失败时提示文件路径并返回 `1`。
 
-原始消息保存在 `raw_messages.json`，缺失上下文记录保存在 `fetch_metadata.json`，组装结果保存在 `messages.json`。恢复上下文组装时会一并读取原始消息和缺失记录；若旧案例或写入中断导致缺少元数据，会提示并重新拉取原时间范围的消息，再进行预览确认。
+新 case 的 `triage.json` 保存需要代码分析的话题、指定 Skill 和适用性决定；`resume` 沿用这些决定，不重新分类或改选 Skill。缺少必要分流检查点的新 case 会停止并要求重新执行 `analyze`；旧 case 继续使用原有恢复方式。
 
-没有传 `--skill` 时使用仓库的 `diagnosis_skill`；传入时可选择仓库默认 Skill 或 `allowed_skills` 中的名称。CLI 会先校验本地文件，再通过 app-server `skills/list` 确认 Codex 已发现并启用它，最后以原生 Skill 输入显式激活。实际使用的 Skill 会写入 `diagnosis.json`、`report.md` 和执行日志。
+诊断范围内的原始消息保存在 `raw_messages.json`，缺失上下文记录保存在 `fetch_metadata.json`，组装结果保存在 `messages.json`。恢复上下文组装时会一并读取原始消息和缺失记录；若旧案例或写入中断导致缺少元数据，会提示并重新拉取原时间范围的消息，再进行预览确认。
 
-确认后，终端会持续输出会话、附件、Skill 选择、Codex 初始化、工具步骤和报告保存进度。Codex 暂无新事件时每 10 秒输出一次等待心跳。相同事件会写入 case 的 `execution.log`：
+没有传 `--skill` 时使用仓库的 `diagnosis_skill`；传入时可选择仓库默认 Skill 或 `allowed_skills` 中的名称。确定需要代码后，CLI 才校验白名单和本地文件，并通过另一个隔离 Codex 会话将 Skill 正文作为数据评估。Skill 不适合或适用性不明确时，会解释原因并跳过，使用通用只读代码分析，不自动选择其他 Skill；评估执行失败则在终端输出错误，不创建 case，也不继续诊断。适合时，再通过诊断 app-server 的 `skills/list` 确认发现与启用状态，以原生 Skill 输入显式激活。实际使用的 Skill 会写入 `diagnosis.json`、`report.md` 和执行日志。
+
+终端会持续输出会话、分类、附件、Skill 选择、Codex 初始化、工具步骤和报告保存进度。Codex 暂无新事件时每 10 秒输出一次等待心跳。进入代码诊断并创建 case 后的进度才写入其 `execution.log`，前置校验、确认和附件准备进度只显示在终端：
 
 ```bash
 tail -f ~/.feishu-diagnose/cases/<case-id>/execution.log
@@ -140,130 +179,54 @@ feishu-diagnose show <case-id>
 
 `codex.timeout_seconds` 是等待下一条完整 Codex 响应或事件的上限，不是整个诊断的总时限；等待心跳不会延长该上限。
 
-执行日志不包含聊天正文、附件内容、附件 key、临时文件路径、密钥、原始命令参数或模型完整响应。
+执行日志不包含聊天正文、附件内容、附件 key、临时文件路径、密钥、原始命令参数或模型完整响应。Skill 跳过原因可能引用聊天，仅保存在 `triage.json` 并显示于交互预览；日志只记录跳过事件。
 
 ## 完整流程
 
 ```mermaid
 flowchart TD
-    START(["手动执行 feishu-diagnose analyze"])
-
-    subgraph INPUT["输入与上下文准备"]
-        CONFIG["读取配置、时间范围、Skill 和群聊/私聊参数"]
-        REPO{"仓库别名在白名单中且路径有效？"}
-        SKILL{"默认或覆盖 Skill 在白名单中且文件有效？"}
-        CONFIG_FAIL(["配置错误：退出，尚未创建运行资源"])
-        RESOLVE["按群名或私聊对象搜索会话"]
-        CHOOSE{"存在多个候选？"}
-        SELECT["用户选择唯一会话"]
-        FETCH["分页拉取消息"]
-        EXPAND["交替补全引用父消息与关联话题"]
-        MORE_CONTEXT{"发现未尝试的引用或话题？"}
-        RAW_CHECKPOINT["保存 raw_messages.json 和 fetch_metadata.json"]
-        ASSEMBLE["去重、排序并按关键词组装上下文"]
-        CHECKPOINT["保存 messages.json"]
-        PREVIEW["预览消息、图片、视频、文件和缺失上下文数量"]
-        CONFIRM{"用户确认只读诊断？"}
-        CANCEL["标记 case 为 cancelled，不调用模型"]
-    end
-
-    subgraph ATTACHMENTS["临时附件准备"]
-        MATERIALIZE["下载附件到本次运行的临时目录"]
-        IMAGE["图片：作为 localImage 交给 Codex"]
-        TEXT["文本：按字节限制解码后加入上下文"]
-        VIDEO["视频：仅向 Codex 提供受限临时路径"]
-        PARTIAL{"存在附件下载失败？"}
-        PARTIAL_CONFIRM{"用户确认使用不完整附件继续？"}
-    end
-
-    subgraph DIAGNOSIS["单次 Codex 只读诊断"]
-        APP["启动 CLI 专属 codex app-server --stdio"]
-        DISCOVER["若配置 Skill，调用 skills/list 验证发现与启用状态"]
-        SANDBOX["创建 read-only thread，禁止审批、写文件和外部副作用"]
-        MCP["启动时配置必需的 understand_video MCP 工具"]
-        TURN["启动一个 turn：可选 Skill、聊天、附件、视频映射和仓库"]
-        SEARCH["Codex 搜索代码、Git 历史并整理证据"]
-        NEED_VIDEO{"相关证据包含视频？"}
-        VIDEO_TOOL["Codex 调用 understand_video"]
-        UPLOAD["上传原始视频并等待 provider 激活"]
-        UNDERSTAND["返回摘要和带时间点的观察"]
-        DELETE_REMOTE["finally 删除 provider 侧临时视频"]
-        FINAL["Codex 生成 phase=final_answer 的 Diagnosis JSON"]
-        VALID{"JSON 通过严格 Schema 校验？"}
-    end
-
-    subgraph RESULT["结果、失败与恢复"]
-        SAVE["持久化 diagnosis.json 和确定性 report.md"]
-        COMPLETE["标记 case 为 completed"]
-        FAIL["保存 failure.json 并标记失败阶段"]
-        NO_RETRY["不自动重试"]
-        RESUME(["用户显式执行 resume case-id"])
-        RESTORE["读取 checkpoint，仅从失败阶段及后续阶段继续"]
-        REENTER["重新进入记录的失败阶段"]
-        FETCH_METADATA{"存在 fetch_metadata.json？"}
-    end
-
-    subgraph CLEANUP["所有终态的资源清理"]
-        TERMINATE["finally：若已启动，则终止 CLI 专属 codex app-server"]
-        WAIT{"5 秒内退出？"}
-        KILL["否：kill 后再次等待"]
-        MCP_CLOSE["app-server 退出时关闭视频 MCP 子进程"]
-        LOCAL_DELETE["删除本地临时图片、文本和视频"]
-        REMOTE_DELETE["删除仍存在的 provider 侧临时视频"]
-        PRESERVE["仅保留 case checkpoint、execution.log、报告或失败信息"]
-        END(["本次运行结束"])
-    end
-
-    START --> CONFIG --> REPO
-    REPO -- "否" --> CONFIG_FAIL
-    REPO -- "是" --> SKILL
-    SKILL -- "否" --> CONFIG_FAIL
-    SKILL -- "是或未配置 Skill" --> RESOLVE --> CHOOSE
-    CHOOSE -- "是" --> SELECT --> FETCH
-    CHOOSE -- "否，唯一候选" --> FETCH
-    FETCH --> EXPAND --> MORE_CONTEXT
-    MORE_CONTEXT -- "是" --> EXPAND
-    MORE_CONTEXT -- "否" --> RAW_CHECKPOINT --> ASSEMBLE --> CHECKPOINT --> PREVIEW --> CONFIRM
-    CONFIRM -- "否" --> CANCEL --> TERMINATE
-    CONFIRM -- "是" --> MATERIALIZE
-
-    MATERIALIZE --> IMAGE
-    MATERIALIZE --> TEXT
-    MATERIALIZE --> VIDEO
-    IMAGE --> PARTIAL
-    TEXT --> PARTIAL
-    VIDEO --> PARTIAL
-    PARTIAL -- "是" --> PARTIAL_CONFIRM
-    PARTIAL_CONFIRM -- "否" --> CANCEL
-    PARTIAL_CONFIRM -- "是" --> APP
-    PARTIAL -- "否" --> APP
-
-    APP --> MCP --> DISCOVER --> SANDBOX --> TURN --> SEARCH --> NEED_VIDEO
-    NEED_VIDEO -- "是" --> VIDEO_TOOL --> UPLOAD --> UNDERSTAND --> DELETE_REMOTE --> SEARCH
-    NEED_VIDEO -- "否或视频分析完成" --> FINAL --> VALID
-    VALID -- "是" --> SAVE --> COMPLETE --> TERMINATE
-    VALID -- "否" --> FAIL
-    FETCH -. "API、分页或上下文失败" .-> FAIL
-    MATERIALIZE -. "不可继续的附件失败" .-> FAIL
-    APP -. "初始化、MCP、模型或超时失败" .-> FAIL
-    FAIL --> NO_RETRY --> TERMINATE
-    RESUME --> RESTORE --> REENTER
-    REENTER -. "会话定位失败" .-> RESOLVE
-    REENTER -. "消息拉取失败" .-> FETCH
-    REENTER -. "上下文组装失败" .-> FETCH_METADATA
-    FETCH_METADATA -- "是：沿用原始消息和缺失记录" --> ASSEMBLE
-    FETCH_METADATA -- "否：提示并重新拉取" --> FETCH
-    REENTER -. "等待用户确认时失败" .-> PREVIEW
-    REENTER -. "附件准备失败" .-> MATERIALIZE
-    REENTER -. "Codex 诊断失败：重新下载并确认缺失附件" .-> MATERIALIZE
-
-    TERMINATE --> WAIT
-    WAIT -- "是" --> MCP_CLOSE
-    WAIT -- "否" --> KILL --> MCP_CLOSE
-    MCP_CLOSE --> REMOTE_DELETE --> LOCAL_DELETE --> PRESERVE --> END
-
-    FORCE(["kill -9、断电或系统崩溃：可能绕过 finally，无法保证清理"])
-    START -. "进程被强制中止" .-> FORCE
+    START["执行 analyze，读取项目别名与描述"] --> FETCH["查找会话、拉取正文、补全引用与话题"]
+    FETCH --> FILTER["按关键词选择候选上下文"]
+    FILTER --> TRIAGE["独立 Codex 分类：无工具、无 Skill、临时会话"]
+    TRIAGE --> NEED{"有明确需要代码分析的话题？"}
+    NEED -- "否或信息不足" --> SUMMARY["直接输出总结、跳过原因和待补充信息；不创建 case"]
+    FETCH -. "前置失败" .-> EARLY_ERROR["终端输出错误；不创建 case；重新 analyze"]
+    FILTER -. "没有匹配消息" .-> EARLY_ERROR
+    TRIAGE -. "失败或无效响应" .-> EARLY_ERROR
+    NEED -- "是" --> SCOPE["展示所有总结；在内存中选择诊断话题及必要上下文"]
+    SCOPE --> REPO["校验仓库路径；组装诊断上下文"]
+    REPO --> REQUESTED{"配置或参数指定了 Skill？"}
+    REQUESTED -- "是" --> SKILL["隔离评估 Skill，在内存中记录适用性决定"]
+    REQUESTED -- "否" --> GENERIC["通用只读代码分析"]
+    SKILL --> FIT{"适合全部诊断话题？"}
+    FIT -- "适合" --> USE["选用指定 Skill，诊断时显式激活"]
+    FIT -- "不适合或不明确：说明跳过原因" --> GENERIC
+    USE --> PREVIEW["预览话题、Skill 决定、消息和附件数量"]
+    GENERIC --> PREVIEW
+    PREVIEW --> CONFIRM{"确认代码分析？"}
+    CONFIRM -- "否" --> CANCEL["直接退出；不创建 case 或执行日志"]
+    CONFIRM -- "是" --> MEDIA["临时下载诊断范围内附件"]
+    MEDIA --> PARTIAL{"有附件下载失败？"}
+    PARTIAL -- "否" --> CREATE["进入代码诊断；创建 case 并保存检查点"]
+    PARTIAL -- "是" --> READY{"确认使用不完整附件继续？"}
+    READY -- "否" --> CANCEL
+    READY -- "是" --> CREATE
+    CREATE --> CODEX["独立诊断 Codex：只读检查仓库，可调用视频 MCP"]
+    CODEX --> REPORT["保存 diagnosis.json 和 report.md，终端展示报告"]
+    REPO -. "失败" .-> EARLY_ERROR
+    SKILL -. "评估执行失败" .-> EARLY_ERROR
+    MEDIA -. "失败" .-> EARLY_ERROR
+    CODEX -. "启动失败、诊断失败或无效结果" .-> FAIL["保存失败阶段和错误，终端展示；不自动重试"]
+    FAIL --> RESUME["显式 resume：沿用分流和 Skill 决定，从失败阶段继续"]
+    RESUME --> RESTORE["复用原 case 和决定；从失败阶段恢复，重新下载附件并按需确认"]
+    RESTORE --> CODEX
+    RESTORE -. "用户取消" .-> RESUME_CANCEL["保留原 case，标记 cancelled"]
+    REPORT --> CLEANUP["清理已启动的 app-server、视频 MCP 和临时附件"]
+    CANCEL --> CLEANUP
+    RESUME_CANCEL --> CLEANUP
+    EARLY_ERROR --> CLEANUP
+    SUMMARY --> CLEANUP
+    FAIL --> CLEANUP
 ```
 
 ## 数据与边界
@@ -274,4 +237,6 @@ case 默认保存在 `~/.feishu-diagnose/cases/<case-id>/`，其中可能包含�
 
 ## 手工冒烟测试
 
-先用一段内容已知的短录屏运行 `video-check`，对照检查摘要与时间点；用 `--json` 确认结果可解析。然后准备一个测试群，发送一段问题文本、一张截图和一个 MP4；将对应测试仓库加入配置。运行 `doctor`，再用较短的 `--since` 执行 `analyze`。确认报告包含聊天事实、视频时间点和仓库代码证据，并检查 case 目录中没有残留图片或视频。
+先用一段内容已知的短录屏运行 `video-check`，对照检查摘要与时间点；用 `--json` 确认结果可解析。然后准备一个测试群，发送一段问题文本、一张截图和一个 MP4；将对应测试仓库加入配置，并填写清楚项目描述。运行 `doctor`，再用较短的 `--since` 执行 `analyze`。确认报告包含聊天事实、视频时间点和仓库代码证据，并检查 case 目录中没有残留图片或视频。
+
+再分别检查无关聊天、仅讨论排期的需求、信息不足的讨论：应只输出总结及原因，不新增 case 或下载附件。混合聊天应只诊断代码相关话题及必要上下文；需要检查实现的需求应进入代码分析。指定仅适合 bug 的 Skill 时，需求分析应说明跳过原因；检查无消息、前置失败和两次确认中取消的情况，均不应新增 case 或执行日志。进入代码诊断后若失败，对该 case 执行 `resume`，确认沿用已保存的分流和 Skill 决定。

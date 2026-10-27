@@ -18,11 +18,12 @@ from .errors import ConfigurationError
 from .feishu import FeishuGateway
 from .initialization import initialize
 from .lark_runner import LarkCliRunner
-from .models import CaseState, ConversationCandidate
+from .models import CaseState, ConversationCandidate, DiscussionTriage
 from .orchestrator import AnalyzeRequest, DiagnosisOrchestrator
 from .progress import ProgressEvent, ProgressSink, redact_secrets, sanitize_message
 from .time_range import resolve_time_range
 from .video_check import VideoInputError, check_video
+from .triage import CodexTriageService
 
 app = typer.Typer(no_args_is_help=True, help="Diagnose Feishu discussions against a local repository.")
 REQUIRED_FEISHU_SCOPES = (
@@ -34,9 +35,11 @@ REQUIRED_FEISHU_SCOPES = (
 )
 
 
-def _load_settings(config: Path | None) -> Settings:
+def _load_settings(config: Path | None, *, validate_repositories: bool = True) -> Settings:
     try:
-        return load_settings(config)
+        if validate_repositories:
+            return load_settings(config)
+        return load_settings(config, validate_repositories=False)
     except ConfigurationError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -80,7 +83,11 @@ def build_runtime(
         )
 
     return DiagnosisOrchestrator(
-        settings, store, feishu, codex_factory, progress_sink=progress_sink
+        settings, store, feishu, codex_factory, progress_sink=progress_sink,
+        classifier=CodexTriageService(
+            settings.codex.bin, settings.codex.model, settings.codex.timeout_seconds, progress_sink,
+        ),
+        triage_sink=lambda result: _display_triage(result, settings),
     )
 
 
@@ -98,7 +105,7 @@ def analyze(
 ) -> None:
     if bool(group) == bool(person):
         raise typer.BadParameter("--group and --person are mutually exclusive; specify exactly one")
-    settings = _load_settings(config)
+    settings = _load_settings(config, validate_repositories=False)
     time_range = resolve_time_range(
         since=since or (settings.defaults.message_window if not start and not end else None),
         start=start or None, end=end or None,
@@ -106,10 +113,18 @@ def analyze(
     request = AnalyzeRequest(group_name=group, person_name=person, repo_alias=repo,
                              time_range=time_range, keyword=keyword, skill=skill)
     runtime = build_runtime(settings, _render_progress)
-    state = runtime.analyze(
-        request, _choose_candidate, _confirm
-    )
-    _display_result(runtime.store, state)
+    try:
+        result = runtime.analyze(request, _choose_candidate, _confirm)
+    except Exception as error:
+        typer.echo(f"Error: {sanitize_message(str(error), (settings.video_tool.api_key.get_secret_value(),))}", err=True)
+        raise typer.Exit(code=1) from None
+    if result is None:
+        typer.echo("已取消代码诊断；未创建 case。")
+    elif isinstance(result, DiscussionTriage):
+        _display_triage(result, settings)
+        typer.echo("\n未进行代码诊断；未创建 case。")
+    else:
+        _display_result(runtime.store, result)
 
 
 @app.command("list")
@@ -137,10 +152,15 @@ def show(case_id: str, config: Annotated[Path | None, typer.Option("--config")] 
 
 @app.command()
 def resume(case_id: str, config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
-    runtime = build_runtime(_load_settings(config), _render_progress)
+    settings = _load_settings(config, validate_repositories=False)
+    runtime = build_runtime(settings, _render_progress)
     before = runtime.store.read_state(case_id)
     typer.echo(f"Resuming failed stage: {before.failed_stage}")
-    state = runtime.resume(case_id, choose=_choose_candidate, confirm=_confirm)
+    try:
+        state = runtime.resume(case_id, choose=_choose_candidate, confirm=_confirm)
+    except Exception as error:
+        typer.echo(f"Error: {sanitize_message(str(error), (settings.video_tool.api_key.get_secret_value(),))}", err=True)
+        raise typer.Exit(code=1) from None
     _display_result(runtime.store, state)
 
 
@@ -161,6 +181,19 @@ def _display_result(store: CaseStore, state: CaseState) -> None:
             raise typer.Exit(code=1) from None
         typer.echo()
         typer.echo(report, nl=not report.endswith("\n"))
+
+
+def _display_triage(result: DiscussionTriage, settings: Settings) -> None:
+    labels = {"bug": "问题反馈", "requirement": "需求讨论", "design": "设计讨论", "other": "其他讨论", "unknown": "信息不足"}
+    lines = ["聊天内容总结："]
+    for index, topic in enumerate(result.topics, 1):
+        lines.extend([
+            f"\n{index}. {labels[topic.kind]}：{topic.summary}",
+            ("需要代码分析：" if topic.needs_code else "未进行代码诊断：") + topic.reason,
+        ])
+        if topic.missing_information:
+            lines.append("待补充信息：" + "；".join(topic.missing_information))
+    typer.echo(redact_secrets("\n".join(lines), (settings.video_tool.api_key.get_secret_value(),)))
 
 
 @app.command("video-check")
@@ -276,6 +309,13 @@ def _choose_candidate(candidates: list[ConversationCandidate]) -> ConversationCa
 
 def _confirm(preview: dict) -> bool:
     if preview["kind"] == "messages":
+        if preview.get("topics"):
+            typer.echo("分析话题：" + "；".join(preview["topics"]))
+            assessment = preview.get("skill_assessment")
+            if assessment is not None:
+                typer.echo(f"{'使用' if assessment.applicable else '跳过'} Skill {preview['skill']}：{assessment.reason}")
+            if assessment is None or not assessment.applicable:
+                typer.echo("本次使用通用只读代码分析。")
         typer.echo(f"消息：{preview['messages']}，图片：{preview['images']}，视频：{preview['videos']}，文件：{preview['files']}")
         if preview["missing"]:
             typer.echo(f"缺失上下文：{', '.join(preview['missing'])}")

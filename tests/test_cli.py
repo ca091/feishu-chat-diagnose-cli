@@ -191,3 +191,55 @@ def test_analyze_reports_unreadable_report(tmp_path, mocker, report_content) -> 
     assert "无法读取诊断报告" in result.stderr
     assert str(store.case_dir(state.case_id) / "report.md") in result.stderr
     assert "Traceback" not in result.output
+
+
+def test_analyze_summary_only_ignores_missing_local_repository_and_skill(tmp_path, mocker):
+    from feishu_chat_diagnose.models import DiscussionTriage
+
+    config = tmp_path / "config.toml"
+    case_root = tmp_path / "cases"
+    config.write_text(f'''
+[defaults]
+case_dir = "{case_root}"
+[repositories.demo]
+path = "/unavailable/repository"
+description = "文档编辑器"
+diagnosis_skill = "missing-skill"
+''')
+    result = DiscussionTriage(topics=[{
+        "kind": "requirement", "summary": "讨论下周需求排期", "project_related": "yes",
+        "needs_code": False, "reason": "仅涉及优先级，不需要查看代码",
+        "message_ids": ["message"], "missing_information": [],
+    }])
+    mocker.patch("feishu_chat_diagnose.cli.build_runtime").return_value.analyze.return_value = result
+    output = CliRunner().invoke(app, ["analyze", "--repo", "demo", "--group", "Test", "--config", str(config)])
+    assert output.exit_code == 0, output.output
+    assert "讨论下周需求排期" in output.stdout and "不需要查看代码" in output.stdout
+    assert "未创建 case" in output.stdout and "case:" not in output.stdout
+    assert not case_root.exists()
+
+
+def test_analyze_classification_error_is_redacted_without_case_or_traceback(tmp_path, mocker):
+    settings = Settings(defaults={"case_dir": tmp_path / "cases"}, video_tool={"api_key": "configured-key"})
+    mocker.patch("feishu_chat_diagnose.cli.load_settings", return_value=settings)
+    runtime = mocker.patch("feishu_chat_diagnose.cli.build_runtime").return_value
+    runtime.analyze.side_effect = RuntimeError("classification failed: configured-key")
+    output = CliRunner().invoke(app, ["analyze", "--repo", "demo", "--group", "Test"])
+    assert output.exit_code == 1
+    assert output.stdout == "" and "classification failed: [REDACTED]" in output.stderr
+    assert "configured-key" not in output.output and "Traceback" not in output.output
+    assert not settings.defaults.case_dir.exists()
+
+
+def test_analyze_cancelled_before_diagnosis_has_no_case_output(tmp_path, mocker):
+    settings = Settings(defaults={"case_dir": tmp_path / "cases"})
+    mocker.patch("feishu_chat_diagnose.cli.load_settings", return_value=settings)
+    runtime = mocker.patch("feishu_chat_diagnose.cli.build_runtime").return_value
+    runtime.analyze.return_value = None
+
+    output = CliRunner().invoke(app, ["analyze", "--repo", "demo", "--group", "Test"])
+
+    assert output.exit_code == 0
+    assert "已取消代码诊断；未创建 case。" in output.stdout
+    assert "case:" not in output.stdout and "stage:" not in output.stdout
+    assert not settings.defaults.case_dir.exists()

@@ -9,18 +9,23 @@ class ConversationAssembler:
         self.max_messages = max_messages
 
     def assemble(
-        self, messages: list[NormalizedMessage], keyword: str = ""
+        self, messages: list[NormalizedMessage], keyword: str = "",
+        *, seed_ids: set[str] | None = None, check_limit: bool = True,
     ) -> list[NormalizedMessage]:
+        """Keywords retain full threads; explicit seeds retain only roots and quote ancestors."""
         by_id = {message.message_id: message for message in messages}
         selected = set(by_id)
 
-        if keyword:
+        if seed_ids is not None:
+            selected = seed_ids & set(by_id)
+        elif keyword:
             needle = keyword.casefold()
             selected = {
                 message.message_id
                 for message in by_id.values()
                 if needle in message.text.casefold()
             }
+        if keyword or seed_ids is not None:
             while True:
                 previous_count = len(selected)
                 self._include_quote_ancestors(selected, by_id)
@@ -32,11 +37,12 @@ class ConversationAssembler:
                     )
                 }
                 selected.update(root for root in roots if root in by_id)
-                selected.update(
-                    message.message_id
-                    for message in by_id.values()
-                    if message.thread_root_id in roots
-                )
+                if seed_ids is None:
+                    selected.update(
+                        message.message_id
+                        for message in by_id.values()
+                        if message.thread_root_id in roots
+                    )
                 if len(selected) == previous_count:
                     break
 
@@ -48,7 +54,7 @@ class ConversationAssembler:
                 item.message_id,
             ),
         )
-        if len(result) > self.max_messages:
+        if check_limit and len(result) > self.max_messages:
             raise ContextTooLarge(f"{len(result)} messages exceeds limit {self.max_messages}")
         return result
 

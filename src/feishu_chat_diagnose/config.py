@@ -186,13 +186,14 @@ def load_video_tool_settings(path: Path | None = None) -> VideoToolSettings:
     return settings
 
 
-def load_settings(path: Path | None = None) -> Settings:
+def load_settings(path: Path | None = None, *, validate_repositories: bool = True) -> Settings:
     config_path, payload = _read_config(path)
     try:
         settings = normalize_paths(Settings.model_validate(payload), config_path.parent)
     except ValueError as exc:
         raise ConfigurationError(f"Invalid configuration: {exc}") from exc
-    for alias in settings.repositories:
-        settings.repository(alias)
-        settings.diagnosis_skill(alias)
+    if validate_repositories:
+        for alias in settings.repositories:
+            settings.repository(alias)
+            settings.diagnosis_skill(alias)
     return settings

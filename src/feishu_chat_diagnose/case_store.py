@@ -10,7 +10,7 @@ from .errors import InvalidStageTransition
 from .models import CaseStage, CaseState
 
 _NEXT: dict[CaseStage, set[CaseStage]] = {
-    "created": {"resolving_conversation"},
+    "created": {"resolving_conversation", "diagnosing_repository"},
     "resolving_conversation": {"fetching_messages"},
     "fetching_messages": {"assembling_context"},
     "assembling_context": {"awaiting_confirmation"},
