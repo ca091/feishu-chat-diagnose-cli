@@ -9,20 +9,11 @@ def test_report_contains_evidence_confidence_and_missing_information() -> None:
                                                    explanation="Transform applied twice")],
         alternative_hypotheses=[], missing_information=["Browser version"],
         recommended_fix_direction=["Normalize transform"], recommended_verification=["Regression test"],
+        skills_used=["project-bugfix"],
     )
     report = render_report(diagnosis)
     assert "## 最可能根因" in report
     assert "置信度：82/100" in report
     assert "`src/export.ts:42` `exportCanvas`" in report
     assert "## 缺失信息" in report
-
-
-def test_report_lists_applied_skills() -> None:
-    diagnosis = Diagnosis(
-        problem_summary="Issue", facts=[], root_cause="Cause", confidence=80,
-        code_evidence=[], alternative_hypotheses=[], missing_information=[],
-        recommended_fix_direction=[], recommended_verification=[],
-        skills_used=["project-bugfix"],
-    )
-
-    assert "## 使用的 Skill\n- `project-bugfix`" in render_report(diagnosis)
+    assert "## 使用的 Skill\n- `project-bugfix`" in report

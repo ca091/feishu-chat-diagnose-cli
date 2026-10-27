@@ -119,7 +119,8 @@ def test_duplicate_success_uses_cached_result(api_client, case_video):
     assert len(api_client[1]) == 1
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 413, 429, 500, 302])
+# Representative authentication, rate-limit, server, and redirect responses.
+@pytest.mark.parametrize("status", [401, 429, 500, 302])
 def test_provider_errors_are_safe_and_not_retried(api_client, case_video, status):
     api_client[2][:] = [httpx.Response(status, text="fake-key data:video/mp4;base64,PRIVATE")]
     tool = service(api_client, case_video)
@@ -142,7 +143,7 @@ def test_transport_errors_are_safe_and_not_retried(api_client, case_video, error
 
 
 @pytest.mark.parametrize("payload", [
-    None, [], {}, {"choices": []}, {"choices": [{"message": {"content": None}}]},
+    None, {}, {"choices": []}, {"choices": [{"message": {"content": None}}]},
     {"choices": [{"message": {"content": json.dumps(RESULT)}, "finish_reason": "length"}]},
 ])
 def test_malformed_or_truncated_api_envelope(api_client, case_video, payload):

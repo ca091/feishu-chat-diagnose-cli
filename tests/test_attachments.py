@@ -82,13 +82,16 @@ def test_attachment_progress_uses_only_ordinal_and_kind(tmp_path: Path) -> None:
     assert str(tmp_path) not in text
 
 
-@pytest.mark.parametrize("media_type,extension", [
-    ("video/mp4", ".mp4"), ("video/quicktime", ".mov"),
-    ("video/webm", ".webm"), ("video/x-matroska", ".mkv"),
-    ("video/x-msvideo", ".avi"), ("video/x-flv", ".flv"),
-    ("video/x-ms-wmv", ".wmv"),
+# Cover each MIME mapping and each filename fallback without a Cartesian product.
+@pytest.mark.parametrize("media_type,extension,name", [
+    ("video/mp4", ".mp4", ""),
+    ("video/quicktime", ".mov", "recording"),
+    ("video/webm", ".webm", "download.bin"),
+    ("video/x-matroska", ".mkv", ""),
+    ("video/x-msvideo", ".avi", "recording"),
+    ("video/x-flv", ".flv", "download.bin"),
+    ("video/x-ms-wmv", ".wmv", ""),
 ])
-@pytest.mark.parametrize("name", ["", "recording", "download.bin"])
 def test_video_mime_survives_parse_download_and_validation(tmp_path, media_type, extension, name):
     from feishu_chat_diagnose.feishu import _parse_attachment
     from feishu_chat_diagnose.video_input import validate_video

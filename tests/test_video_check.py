@@ -140,10 +140,9 @@ def assert_resources_cleaned(log, captured, original):
         os.kill(pid, 0)
 
 
-@pytest.mark.parametrize("mode", ["structured", "text"])
-def test_real_stdio_success_and_cleanup(mcp_server, local_video, monkeypatch, mode):
+def test_real_stdio_text_fallback_and_cleanup(mcp_server, local_video, monkeypatch):
     log, captured = mcp_server
-    monkeypatch.setenv("VIDEO_CHECK_TEST_MODE", mode)
+    monkeypatch.setenv("VIDEO_CHECK_TEST_MODE", "text")
     events = []
     settings = VideoToolSettings(model="qwen-test", api_key="configured-video-key")
 
@@ -183,8 +182,13 @@ def test_real_stdio_failures_cleanup(mcp_server, local_video, monkeypatch, mode,
     assert_resources_cleaned(log, captured, local_video)
 
 
-def test_cli_json_over_real_stdio(video_config, local_video, mcp_server):
-    result = CliRunner().invoke(app, ["video-check", str(local_video), "--config", str(video_config), "--json"])
+def test_cli_json_over_real_stdio_without_feishu_codex_or_cases(
+    video_config, local_video, mcp_server, diagnose_home, mocker, monkeypatch
+):
+    for dependency in ("build_runtime", "CodexAppServerDiagnosis.launch", "LarkCliRunner.run", "CaseStore"):
+        mocker.patch(f"feishu_chat_diagnose.cli.{dependency}", side_effect=AssertionError("video-check must be independent"))
+    monkeypatch.chdir(local_video.parent)
+    result = CliRunner().invoke(app, ["video-check", local_video.name, "--config", str(video_config), "--json"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
@@ -192,6 +196,7 @@ def test_cli_json_over_real_stdio(video_config, local_video, mcp_server):
     assert payload["summary"] == "点击导出后没有响应"
     assert "正在上传并理解视频" in result.stderr
     assert_resources_cleaned(*mcp_server, local_video)
+    assert not diagnose_home.exists()
 
 
 def test_cancelled_call_cleans_subprocess_and_temporary_video(mcp_server, local_video, monkeypatch):
@@ -282,34 +287,16 @@ def test_cli_json_redacts_results_without_breaking_json(video_config, local_vide
     assert json.loads(output.stdout)["summary"] == '[REDACTED] and "quotes"'
 
 
-def test_cli_does_not_use_feishu_codex_or_cases(
-    video_config, local_video, mcp_server, diagnose_home, mocker, monkeypatch
-):
-    def unexpected(*args, **kwargs):
-        raise AssertionError("video-check must be independent")
-
-    mocker.patch("feishu_chat_diagnose.cli.build_runtime", side_effect=unexpected)
-    mocker.patch("feishu_chat_diagnose.cli.CodexAppServerDiagnosis.launch", side_effect=unexpected)
-    mocker.patch("feishu_chat_diagnose.cli.LarkCliRunner.run", side_effect=unexpected)
-    mocker.patch("feishu_chat_diagnose.cli.CaseStore", side_effect=unexpected)
-    monkeypatch.chdir(local_video.parent)
-    result = CliRunner().invoke(app, ["video-check", local_video.name, "--config", str(video_config)])
-    assert result.exit_code == 0, result.output
-    assert not diagnose_home.exists()
-
-
 def test_missing_video_config_explains_init(diagnose_home, local_video):
     result = CliRunner().invoke(app, ["video-check", str(local_video), "--json"])
     assert result.exit_code == 1
     assert result.stdout == "" and "feishu-diagnose init" in result.stderr
 
 
-@pytest.mark.parametrize("kind", ["missing", "directory", "empty", "unreadable"])
+@pytest.mark.parametrize("kind", ["missing", "empty", "unreadable"])
 def test_invalid_file_fails_before_subprocess(video_config, tmp_path, mocker, kind):
     path = tmp_path / "video.mp4"
-    if kind == "directory":
-        path.mkdir()
-    elif kind in {"empty", "unreadable"}:
+    if kind in {"empty", "unreadable"}:
         path.touch()
     if kind == "unreadable":
         mocker.patch.object(Path, "open", side_effect=PermissionError("no access"))

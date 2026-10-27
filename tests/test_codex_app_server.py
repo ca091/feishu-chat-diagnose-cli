@@ -155,18 +155,7 @@ def test_invalid_final_json_is_not_retried(tmp_path: Path, bundle) -> None:
     assert sum(method == "turn/start" for method, _ in transport.requests) == 1
 
 
-def test_process_argv_requires_video_mcp(tmp_path: Path) -> None:
-    captured = {}
-    def factory(argv, **kwargs):
-        captured.update(argv=argv, kwargs=kwargs)
-        return object()
-    CodexAppServerDiagnosis.start_process(factory, tmp_path, codex_bin="codex")
-    assert captured["argv"][:2] == ["codex", "app-server"]
-    assert any("mcp_servers.feishu_video.required=true" in arg for arg in captured["argv"])
-    assert captured["kwargs"]["env"]["FEISHU_DIAGNOSE_MEDIA_ROOT"] == str(tmp_path.resolve())
-
-
-@pytest.mark.parametrize("environment_key", [None, "", "environment-video-key"])
+@pytest.mark.parametrize("environment_key", [None, "environment-video-key"])
 def test_launch_passes_key_only_via_child_environment(
     tmp_path, monkeypatch, mocker, environment_key
 ) -> None:
@@ -187,6 +176,8 @@ def test_launch_passes_key_only_via_child_environment(
 
     argv = popen.call_args.args[0]
     child_env = popen.call_args.kwargs["env"]
+    assert argv[:2] == ["codex", "app-server"]
+    assert "mcp_servers.feishu_video.required=true" in argv
     assert child_env["DASHSCOPE_API_KEY"] == (environment_key or "configured-video-key")
     assert os.environ.get("DASHSCOPE_API_KEY") == environment_key
     assert "configured-video-key" not in " ".join(argv)

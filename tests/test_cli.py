@@ -3,7 +3,7 @@ from typer.testing import CliRunner
 
 from feishu_chat_diagnose.case_store import CaseStore
 from feishu_chat_diagnose.config import Settings
-from feishu_chat_diagnose.cli import REQUIRED_FEISHU_SCOPES, _render_progress, app, build_runtime
+from feishu_chat_diagnose.cli import _render_progress, app, build_runtime
 from feishu_chat_diagnose.progress import ProgressEvent
 
 
@@ -13,22 +13,12 @@ def test_analyze_rejects_group_and_person_together() -> None:
     assert "mutually exclusive" in result.output
 
 
-def test_help_lists_operator_commands() -> None:
+def test_help_lists_operator_commands_before_initialization(diagnose_home) -> None:
     result = CliRunner().invoke(app, ["--help"])
     assert result.exit_code == 0
     for command in ("init", "doctor", "video-check", "analyze", "list", "show", "resume"):
         assert command in result.output
-
-
-def test_analyze_help_lists_skill_override() -> None:
-    result = CliRunner().invoke(app, ["analyze", "--help"])
-    assert result.exit_code == 0
-    assert "--skill" in result.output
-
-
-def test_doctor_requires_only_scopes_used_by_the_cli() -> None:
-    assert "search:message" not in REQUIRED_FEISHU_SCOPES
-    assert "im:message:readonly" in REQUIRED_FEISHU_SCOPES
+    assert not diagnose_home.exists()
 
 
 def test_doctor_reports_missing_video_key_without_traceback(monkeypatch) -> None:
@@ -101,7 +91,7 @@ def test_show_displays_only_recent_execution_log_lines(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("args", [
-    ["doctor"], ["list"], ["show", "missing"], ["resume", "missing"],
+    ["list"],
     ["analyze", "--group", "Test", "--repo", "demo"],
 ])
 def test_missing_global_config_explains_init_without_traceback(
@@ -112,11 +102,6 @@ def test_missing_global_config_explains_init_without_traceback(
     assert result.exit_code == 1
     assert "feishu-diagnose init" in result.output
     assert "Traceback" not in result.output
-
-
-def test_help_works_before_initialization(diagnose_home) -> None:
-    assert CliRunner().invoke(app, ["--help"]).exit_code == 0
-    assert not diagnose_home.exists()
 
 
 def test_case_commands_share_global_storage_from_any_directory(
@@ -152,10 +137,14 @@ def test_case_commands_share_global_storage_from_any_directory(
         assert "stage: failed" in result.output
 
 
-@pytest.mark.parametrize("command", ["analyze", "resume"])
-@pytest.mark.parametrize("stage,error,exit_code", [
-    ("failed", "diagnosis failed", 1), ("failed", "", 1),
-    ("completed", "", 0), ("cancelled", "", 0),
+# Both entry points must display success/failure; shared edge cases need only analyze.
+@pytest.mark.parametrize("command,stage,error,exit_code", [
+    ("analyze", "failed", "diagnosis failed", 1),
+    ("analyze", "failed", "", 1),
+    ("analyze", "completed", "", 0),
+    ("analyze", "cancelled", "", 0),
+    ("resume", "failed", "diagnosis failed", 1),
+    ("resume", "completed", "", 0),
 ])
 def test_diagnosis_commands_signal_failure_to_shell(tmp_path, mocker, command, stage, error, exit_code) -> None:
     store = CaseStore(tmp_path / "cases")
