@@ -80,12 +80,14 @@ def build_runtime(
             video_base_url=settings.video_tool.base_url,
             video_timeout_seconds=settings.video_tool.timeout_seconds,
             timeout_seconds=settings.codex.timeout_seconds,
+            total_timeout_seconds=settings.codex.total_timeout_seconds,
         )
 
     return DiagnosisOrchestrator(
         settings, store, feishu, codex_factory, progress_sink=progress_sink,
         classifier=CodexTriageService(
             settings.codex.bin, settings.codex.model, settings.codex.timeout_seconds, progress_sink,
+            total_timeout_seconds=settings.codex.total_timeout_seconds,
         ),
         triage_sink=lambda result: _display_triage(result, settings),
     )

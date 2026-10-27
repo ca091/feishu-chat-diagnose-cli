@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -79,6 +80,12 @@ class NormalizedMessage(BaseModel):
 
 class FetchMetadata(BaseModel):
     missing_message_ids: list[str]
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    messages: list[NormalizedMessage]
+    missing_message_ids: list[str] = field(default_factory=list)
 
 
 class MessageBundle(BaseModel):

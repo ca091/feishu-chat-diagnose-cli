@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from .codex_app_server import JsonRpcTransport, StdioJsonRpcTransport, strict_json_schema
+from .codex_protocol import JsonRpcTransport, StdioJsonRpcTransport, strict_json_schema
 from .errors import DiagnoseError
 from .models import DiscussionTriage, NormalizedMessage, SkillAssessment
 from .progress import ProgressSink
@@ -157,9 +157,11 @@ class CodexTriageService:
     def __init__(
         self, codex_bin: str, model: str, timeout_seconds: float,
         progress: ProgressSink | None = None,
+        *, total_timeout_seconds: float = 1800,
     ) -> None:
         self.codex_bin, self.model, self.timeout_seconds = codex_bin, model, timeout_seconds
         self.progress = progress
+        self.total_timeout_seconds = total_timeout_seconds
 
     def _run(self, operation: Callable[[CodexDiscussionClassifier], Result]) -> Result:
         with tempfile.TemporaryDirectory(prefix="feishu-triage-") as directory:
@@ -171,7 +173,10 @@ class CodexTriageService:
                 argv, cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, shell=False,
             )
-            transport = StdioJsonRpcTransport(process, self.timeout_seconds, progress=self.progress)
+            transport = StdioJsonRpcTransport(
+                process, self.timeout_seconds, progress=self.progress,
+                total_timeout_seconds=self.total_timeout_seconds,
+            )
             try:
                 return operation(CodexDiscussionClassifier(transport, workspace, self.model))
             finally:

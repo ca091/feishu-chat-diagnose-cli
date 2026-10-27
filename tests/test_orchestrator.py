@@ -8,7 +8,7 @@ from feishu_chat_diagnose.config import Settings
 from feishu_chat_diagnose.errors import ConfigurationError, ContextTooLarge
 from feishu_chat_diagnose.models import (
     AttachmentRef, CodeEvidence, ConversationCandidate, Diagnosis, NormalizedMessage,
-    RepositorySettings, Sender, TimeRange, DiscussionTriage, DiscussionTopic, SkillAssessment,
+    RepositorySettings, Sender, TimeRange, DiscussionTriage, DiscussionTopic, SkillAssessment, FetchResult,
 )
 from feishu_chat_diagnose.orchestrator import AnalyzeRequest, DiagnosisOrchestrator
 
@@ -18,6 +18,7 @@ class FakeFeishu:
         self.message = message
         self.fetch_count = 0
         self.fail_fetch_once = False
+        self.missing_message_ids = []
 
     def search_groups(self, name):
         return [ConversationCandidate(chat_id="oc_1", name=name, conversation_type="group")]
@@ -28,7 +29,7 @@ class FakeFeishu:
         if self.fail_fetch_once:
             self.fail_fetch_once = False
             raise RuntimeError("temporary fetch failure")
-        return [self.message]
+        return FetchResult([self.message], list(self.missing_message_ids))
     def download_attachment(self, attachment, root, output_name): raise AssertionError
 
 
@@ -325,7 +326,7 @@ def test_resume_from_preparing_attachments_uses_shared_confirmation_and_cleanup(
 @pytest.mark.parametrize("legacy", [False, True])
 def test_resume_assembly_preserves_missing_context_across_processes(tmp_path, legacy) -> None:
     orchestrator, request, calls = runtime(tmp_path)
-    orchestrator.feishu.last_missing_message_ids = ["missing_parent"]
+    orchestrator.feishu.missing_message_ids = ["missing_parent"]
     orchestrator.feishu.message.reply_to_message_id = "missing_parent"
     orchestrator.settings.defaults.max_messages = 0
     failed = legacy_assembly_case(orchestrator, request)
@@ -340,7 +341,7 @@ def test_resume_assembly_preserves_missing_context_across_processes(tmp_path, le
         (store.case_dir(failed.case_id) / "fetch_metadata.json").unlink()
 
     gateway = FakeFeishu(orchestrator.feishu.message)
-    gateway.last_missing_message_ids = ["refetched_parent"] if legacy else []
+    gateway.missing_message_ids = ["refetched_parent"] if legacy else []
     settings = orchestrator.settings.model_copy(deep=True)
     settings.defaults.max_messages = 300
     events, previews = [], []
@@ -369,7 +370,7 @@ def test_legacy_assembly_refetch_failure_can_be_resumed_again(tmp_path) -> None:
     orchestrator.settings.defaults.max_messages = 300
     gateway = FakeFeishu(orchestrator.feishu.message)
     gateway.fail_fetch_once = True
-    gateway.last_missing_message_ids = ["missing_parent"]
+    gateway.missing_message_ids = ["missing_parent"]
     resumed_runtime = DiagnosisOrchestrator(
         orchestrator.settings, orchestrator.store, gateway, lambda root: FakeCodex(calls),
     )
@@ -388,7 +389,7 @@ def test_resumed_fetch_checkpoints_missing_context_before_assembly_failure(tmp_p
     orchestrator, request, _ = runtime(tmp_path)
     failed = legacy_fetch_case(orchestrator, request)
     orchestrator.settings.defaults.max_messages = 0
-    orchestrator.feishu.last_missing_message_ids = ["missing_parent"]
+    orchestrator.feishu.missing_message_ids = ["missing_parent"]
 
     failed_assembly = orchestrator.resume(failed.case_id, confirm=lambda preview: True)
 
@@ -419,7 +420,7 @@ def test_interrupted_legacy_checkpoint_is_refetched_on_next_resume(tmp_path, moc
     assert failed_again.stage == "failed" and failed_again.failed_stage == "assembling_context"
     assert not metadata.exists()
     writer.side_effect = write_json
-    orchestrator.feishu.last_missing_message_ids = ["missing_parent"]
+    orchestrator.feishu.missing_message_ids = ["missing_parent"]
     previews = []
 
     cancelled = orchestrator.resume(
@@ -453,6 +454,36 @@ def test_summary_only_never_creates_case_or_loads_repository_and_skill(tmp_path,
     assert not orchestrator.store.root.exists() and calls == []
 
 
+@pytest.mark.parametrize("budget", ["messages", "text_bytes"])
+def test_triage_budget_is_independent_and_excess_stops_before_classifier(tmp_path, mocker, budget):
+    orchestrator, request, calls = runtime(tmp_path)
+    orchestrator.settings.defaults.max_messages = 0
+    orchestrator.settings.defaults.max_triage_messages = 1
+    orchestrator.feishu.message.text = "中"
+    orchestrator.settings.repositories["repo"].description = "项目"
+    # UTF-8 budget includes the project alias/description and chat body.
+    orchestrator.settings.defaults.max_triage_text_bytes = len("repo项目中".encode("utf-8"))
+    triage = DiscussionTriage(topics=[DiscussionTopic(
+        kind="other", summary="讨论总结", project_related="no", needs_code=False,
+        reason="无需代码分析", message_ids=["om_1"], missing_information=[],
+    )])
+    classify = mocker.patch.object(orchestrator.classifier, "classify", return_value=triage)
+    confirm = mocker.Mock()
+    assert orchestrator.analyze(request, lambda items: items[0], confirm) == triage
+    if budget == "messages":
+        extra = orchestrator.feishu.message.model_copy(update={"message_id": "extra", "text": ""})
+        mocker.patch.object(orchestrator.feishu, "fetch_messages", return_value=FetchResult([
+            orchestrator.feishu.message, extra,
+        ]))
+    else:
+        orchestrator.settings.defaults.max_triage_text_bytes -= 1
+    with pytest.raises(ContextTooLarge, match="请缩短 --since"):
+        orchestrator.analyze(request, lambda items: items[0], confirm)
+    classify.assert_called_once()
+    confirm.assert_not_called()
+    assert not orchestrator.store.root.exists() and not orchestrator._loggers and calls == []
+
+
 @pytest.mark.parametrize("failure", ["fetch", "classification"])
 def test_failures_before_gate_are_transient_and_not_retried(tmp_path, mocker, failure):
     orchestrator, request, calls = runtime(tmp_path)
@@ -473,7 +504,7 @@ def test_failures_before_gate_are_transient_and_not_retried(tmp_path, mocker, fa
 def test_pre_diagnosis_failures_never_create_cases(tmp_path, mocker, failure, error_type, pattern):
     orchestrator, request, calls = runtime(tmp_path)
     if failure == "empty_chat":
-        mocker.patch.object(orchestrator.feishu, "fetch_messages", return_value=[])
+        mocker.patch.object(orchestrator.feishu, "fetch_messages", return_value=FetchResult([]))
     elif failure == "assembly_limit":
         orchestrator.settings.defaults.max_messages = 0
     elif failure == "repository":
@@ -497,7 +528,7 @@ def test_mixed_topics_persist_and_diagnose_only_code_context(tmp_path, mocker, m
         source_message_id="lunch", file_key="never-download", resource_type="file",
         name="lunch.mp4", media_type="video/mp4", kind="video",
     )]
-    mocker.patch.object(orchestrator.feishu, "fetch_messages", return_value=messages)
+    mocker.patch.object(orchestrator.feishu, "fetch_messages", return_value=FetchResult(messages))
     download = mocker.spy(orchestrator.feishu, "download_attachment")
     triage = DiscussionTriage(topics=[
         DiscussionTopic(kind="requirement", summary="新增格式评估", project_related="yes", needs_code=True,

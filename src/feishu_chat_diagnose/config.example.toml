@@ -10,6 +10,10 @@ case_dir = "cases"
 # 最终诊断消息数量上限（含必要根消息与引用祖先）；超限报错，不截断。
 # 此限制不用于截断前置分类的候选消息。
 max_messages = 300
+# 前置分类独立限制候选消息数和正文大小；超限提示缩小范围，不截断、不创建 case。
+max_triage_messages = 1000
+# 聊天正文、项目别名及描述合计的 UTF-8 字节数（256 KiB）。
+max_triage_text_bytes = 262144
 # 单个文本附件最多读取的字节数（1 MiB）。
 max_text_attachment_bytes = 1048576
 
@@ -21,8 +25,11 @@ lark_cli_bin = "lark-cli"
 bin = "codex"
 # 前置分类、Skill 适用性评估和代码诊断共用此模型；留空使用 Codex 默认模型。
 model = ""
-# 等待下一条完整 Codex 响应或事件的超时秒数，不是整个诊断的总时限。
+# 单次 RPC 请求的总等待上限，以及事件流等待下一条完整消息的上限。
 timeout_seconds = 600
+# 每个独立 Codex 会话的执行总时限，包含初始化和模型分析；进度消息不会延长。
+# 分类、Skill 评估、代码诊断分别计时；显式 resume 使用新会话。
+total_timeout_seconds = 1800
 
 [video_tool]
 provider = "dashscope"

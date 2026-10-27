@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, overload
 
 from pydantic import BaseModel, model_validator
 
@@ -11,10 +12,10 @@ from .attachments import AttachmentGateway, AttachmentManager, MaterializedBatch
 from .case_store import CaseStore
 from .config import Settings
 from .conversation import ConversationAssembler
-from .errors import ConfigurationError, ModelOutputError
+from .errors import ConfigurationError, ContextTooLarge, ModelOutputError
 from .models import (
     AttachmentRef, CaseState, ConversationCandidate, ConversationIdentity, Diagnosis,
-    DiagnosisSkill, DiscussionTriage, FetchMetadata, MessageBundle, NormalizedMessage,
+    DiagnosisSkill, DiscussionTriage, FetchMetadata, FetchResult, MessageBundle, NormalizedMessage,
     SkillAssessment, TimeRange, TriageCheckpoint,
 )
 from .report import render_report
@@ -40,7 +41,7 @@ class FeishuPort(AttachmentGateway, Protocol):
     def search_groups(self, name: str) -> list[ConversationCandidate]: ...
     def search_people(self, name: str) -> list[ConversationCandidate]: ...
     def resolve_private_chat(self, name: str, participant_open_id: str) -> ConversationIdentity: ...
-    def fetch_messages(self, chat_id: str, time_range: TimeRange) -> list[NormalizedMessage]: ...
+    def fetch_messages(self, chat_id: str, time_range: TimeRange) -> FetchResult: ...
 
 
 class CodexPort(Protocol):
@@ -58,6 +59,14 @@ class TriagePort(Protocol):
 
 ChooseCandidate = Callable[[list[ConversationCandidate]], ConversationCandidate]
 Confirm = Callable[[dict[str, Any]], bool]
+
+
+@dataclass(frozen=True)
+class _NewCase:
+    request: AnalyzeRequest
+    raw_messages: list[NormalizedMessage]
+    fetch_metadata: FetchMetadata
+    triage: TriageCheckpoint
 
 
 class DiagnosisOrchestrator:
@@ -94,14 +103,15 @@ class DiagnosisOrchestrator:
         self._progress("conversation.resolving", "正在查找飞书会话")
         conversation = self._resolve(request, choose)
         self._progress("messages.fetching", "正在拉取消息并补全引用与话题上下文")
-        raw_messages = self.feishu.fetch_messages(conversation.chat_id, request.time_range)
-        if not raw_messages:
+        fetched = self.feishu.fetch_messages(conversation.chat_id, request.time_range)
+        if not fetched.messages:
             raise RuntimeError("No messages found in the selected time range")
         candidates = ConversationAssembler(self.settings.defaults.max_messages).assemble(
-            raw_messages, request.keyword, check_limit=False,
+            fetched.messages, request.keyword, check_limit=False,
         )
         if not candidates:
             raise RuntimeError("No messages match the requested context filter")
+        self._check_triage_budget(request.repo_alias, repository_info.description, candidates)
         if self.classifier is None:
             raise RuntimeError("Discussion classifier is not configured")
         self._progress("triage.started", "正在根据聊天正文判断讨论类型和代码分析必要性")
@@ -119,7 +129,7 @@ class DiagnosisOrchestrator:
             message.message_id, message.reply_to_message_id, message.thread_root_id,
         ) if value}
         metadata = FetchMetadata(missing_message_ids=[
-            value for value in getattr(self.feishu, "last_missing_message_ids", []) if value in references
+            value for value in fetched.missing_message_ids if value in references
         ])
         checkpoint = TriageCheckpoint(
             triage=DiscussionTriage(topics=[topic for topic in triage.topics if topic.needs_code]),
@@ -132,40 +142,26 @@ class DiagnosisOrchestrator:
         if not confirm(self._preview(bundle, checkpoint)):
             return None
         self._progress("confirmation.accepted", "用户已确认，正在准备只读诊断")
-        case_id: str | None = None
-        try:
-            with tempfile.TemporaryDirectory(prefix="feishu-diagnose-") as directory:
-                media_root = Path(directory)
-                manager = AttachmentManager(
-                    self.feishu, media_root, self.settings.defaults.max_text_attachment_bytes,
-                    progress=self._transient_progress,
-                )
-                with manager.materialize(_attachments(bundle)) as batch:
-                    if batch.failed and not confirm(self._failure_preview(batch)):
-                        return None
-                    state = self.store.create({**request.model_dump(mode="json"), "triage_required": True})
-                    case_id = state.case_id
-                    self.store.transition(case_id, "diagnosing_repository")
-                    self._write_triage_checkpoint(case_id, checkpoint)
-                    self.store.write_json(case_id, "conversation.json", conversation.model_dump(mode="json"))
-                    self._write_fetch_checkpoint(case_id, selected, metadata)
-                    self.store.write_json(case_id, "messages.json", bundle.model_dump(mode="json"))
-                    logger = self._logger(case_id)
-                    logger.info(
-                        "case.created",
-                        f"诊断 case 已创建：{case_id}；执行日志：{self.store.case_dir(case_id) / 'execution.log'}",
-                    )
-                    if checkpoint.skill_assessment is not None and not checkpoint.skill_assessment.applicable:
-                        logger.warning(
-                            "skill.skipped", f"跳过 Skill {checkpoint.requested_skill}；使用通用只读代码分析",
-                        )
-                    result = self._run_codex(case_id, repository.path, bundle, batch, media_root, skill)
-            self._logger(case_id).info("case.completed", "诊断完成，报告已保存")
-            return result
-        except Exception as error:
-            if case_id is None:
-                raise
-            return self._record_failure(case_id, error)
+        return self._materialize_and_diagnose(
+            _NewCase(request, selected, metadata, checkpoint), repository.path, bundle, skill, confirm,
+        )
+
+    def _check_triage_budget(
+        self, repo_alias: str, description: str, messages: list[NormalizedMessage],
+    ) -> None:
+        limits = self.settings.defaults
+        if len(messages) > limits.max_triage_messages:
+            raise ContextTooLarge(
+                f"讨论分类候选消息共 {len(messages)} 条，超过上限 {limits.max_triage_messages}；"
+                "请缩短 --since、调整 --start/--end 或使用 --keyword 缩小范围"
+            )
+        text_bytes = len(repo_alias.encode("utf-8")) + len(description.encode("utf-8"))
+        text_bytes += sum(len(message.text.encode("utf-8")) for message in messages)
+        if text_bytes > limits.max_triage_text_bytes:
+            raise ContextTooLarge(
+                f"讨论分类正文及项目描述共 {text_bytes} 字节（UTF-8），超过上限 {limits.max_triage_text_bytes}；"
+                "请缩短 --since、调整 --start/--end 或使用 --keyword 缩小范围"
+            )
 
     def _assemble_bundle(
         self, request: AnalyzeRequest, conversation: ConversationIdentity,
@@ -244,14 +240,17 @@ class DiagnosisOrchestrator:
                         "resume.legacy_checkpoint",
                         "旧案例缺少缺失上下文记录，正在重新拉取消息以恢复完整状态",
                     )
-                    raw = self.feishu.fetch_messages(conversation.chat_id, request.time_range)
+                    fetched = self.feishu.fetch_messages(conversation.chat_id, request.time_range)
+                    raw = fetched.messages
                     if not raw:
                         raise RuntimeError("No messages found in the selected time range")
                     if checkpoint is not None:
                         raw = ConversationAssembler(self.settings.defaults.max_messages).assemble(
                             raw, seed_ids=checkpoint.triage.code_message_ids, check_limit=False,
                         )
-                    fetch_metadata = self._write_fetch_checkpoint(case_id, raw)
+                    fetch_metadata = self._write_fetch_checkpoint(
+                        case_id, raw, FetchMetadata(missing_message_ids=fetched.missing_message_ids),
+                    )
                 return self._resume_assemble(
                     case_id, request, repository.path, conversation, raw, skill, confirm,
                     fetch_metadata, enter_stage=False,
@@ -290,10 +289,13 @@ class DiagnosisOrchestrator:
     ) -> CaseState:
         if enter_stage:
             self.store.transition(case_id, "fetching_messages")
-        raw = self.feishu.fetch_messages(conversation.chat_id, request.time_range)
+        fetched = self.feishu.fetch_messages(conversation.chat_id, request.time_range)
+        raw = fetched.messages
         if not raw:
             raise RuntimeError("No messages found in the selected time range")
-        fetch_metadata = self._write_fetch_checkpoint(case_id, raw)
+        fetch_metadata = self._write_fetch_checkpoint(
+            case_id, raw, FetchMetadata(missing_message_ids=fetched.missing_message_ids),
+        )
         return self._resume_assemble(
             case_id, request, repository, conversation, raw, skill, confirm, fetch_metadata
         )
@@ -324,11 +326,8 @@ class DiagnosisOrchestrator:
         )
 
     def _write_fetch_checkpoint(
-        self, case_id: str, messages: list[NormalizedMessage], metadata: FetchMetadata | None = None,
+        self, case_id: str, messages: list[NormalizedMessage], metadata: FetchMetadata,
     ) -> FetchMetadata:
-        metadata = metadata if metadata is not None else FetchMetadata(
-            missing_message_ids=list(getattr(self.feishu, "last_missing_message_ids", []))
-        )
         # Publish metadata last so an interrupted write cannot pair new metadata
         # with stale messages. An incomplete checkpoint will be fetched again.
         (self.store.case_dir(case_id) / "fetch_metadata.json").unlink(missing_ok=True)
@@ -351,28 +350,63 @@ class DiagnosisOrchestrator:
             return self.feishu.resolve_private_chat(selected.name, selected.participant_open_id)
         return ConversationIdentity.model_validate(selected.model_dump())
 
+    @overload
     def _materialize_and_diagnose(
-        self, case_id: str, repository: Path, bundle: MessageBundle,
+        self, case: str, repository: Path, bundle: MessageBundle,
         skill: DiagnosisSkill | None, confirm_partial: Confirm,
-    ) -> CaseState:
-        refs = _attachments(bundle)
-        with tempfile.TemporaryDirectory(prefix="feishu-diagnose-") as directory:
-            manager = AttachmentManager(
-                self.feishu, Path(directory), self.settings.defaults.max_text_attachment_bytes,
-                progress=self._logger(case_id).forward,
-            )
-            with manager.materialize(refs) as batch:
-                if batch.failed and not confirm_partial(self._failure_preview(batch)):
-                    result = self.store.transition(case_id, "cancelled")
-                else:
-                    if self.store.read_state(case_id).stage != "diagnosing_repository":
+    ) -> CaseState: ...
+
+    @overload
+    def _materialize_and_diagnose(
+        self, case: _NewCase, repository: Path, bundle: MessageBundle,
+        skill: DiagnosisSkill | None, confirm_partial: Confirm,
+    ) -> CaseState | None: ...
+
+    def _materialize_and_diagnose(
+        self, case: str | _NewCase, repository: Path, bundle: MessageBundle,
+        skill: DiagnosisSkill | None, confirm_partial: Confirm,
+    ) -> CaseState | None:
+        case_id = case if isinstance(case, str) else None
+        try:
+            with tempfile.TemporaryDirectory(prefix="feishu-diagnose-") as directory:
+                media_root = Path(directory)
+                manager = AttachmentManager(
+                    self.feishu, media_root, self.settings.defaults.max_text_attachment_bytes,
+                    progress=self._logger(case_id).forward if case_id is not None else self._transient_progress,
+                )
+                with manager.materialize(_attachments(bundle)) as batch:
+                    if batch.failed and not confirm_partial(self._failure_preview(batch)):
+                        return self.store.transition(case_id, "cancelled") if case_id is not None else None
+                    if isinstance(case, _NewCase):
+                        state = self.store.create({**case.request.model_dump(mode="json"), "triage_required": True})
+                        case_id = state.case_id
                         self.store.transition(case_id, "diagnosing_repository")
-                    result = self._run_codex(
-                        case_id, repository, bundle, batch, Path(directory), skill
-                    )
-        if result.stage == "completed":
+                        self._initialize_case(case_id, bundle, case)
+                    elif self.store.read_state(case_id).stage != "diagnosing_repository":
+                        self.store.transition(case_id, "diagnosing_repository")
+                    result = self._run_codex(case_id, repository, bundle, batch, media_root, skill)
             self._logger(case_id).info("case.completed", "诊断完成，报告已保存")
-        return result
+            return result
+        except Exception as error:
+            if case_id is None:
+                raise
+            return self._record_failure(case_id, error)
+
+    def _initialize_case(self, case_id: str, bundle: MessageBundle, prepared: _NewCase) -> None:
+        self._write_triage_checkpoint(case_id, prepared.triage)
+        self.store.write_json(case_id, "conversation.json", bundle.conversation.model_dump(mode="json"))
+        self._write_fetch_checkpoint(case_id, prepared.raw_messages, prepared.fetch_metadata)
+        self.store.write_json(case_id, "messages.json", bundle.model_dump(mode="json"))
+        logger = self._logger(case_id)
+        logger.info(
+            "case.created",
+            f"诊断 case 已创建：{case_id}；执行日志：{self.store.case_dir(case_id) / 'execution.log'}",
+        )
+        checkpoint = prepared.triage
+        if checkpoint.skill_assessment is not None and not checkpoint.skill_assessment.applicable:
+            logger.warning(
+                "skill.skipped", f"跳过 Skill {checkpoint.requested_skill}；使用通用只读代码分析",
+            )
 
     def _run_codex(
         self, case_id: str, repository: Path, bundle: MessageBundle,

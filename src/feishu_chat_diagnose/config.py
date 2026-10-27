@@ -28,6 +28,8 @@ class DefaultsSettings(BaseModel):
     message_window: str = "2h"
     case_dir: Path = Field(default_factory=default_case_directory)
     max_messages: int = 300
+    max_triage_messages: int = Field(default=1000, gt=0)
+    max_triage_text_bytes: int = Field(default=262_144, gt=0)
     max_text_attachment_bytes: int = 1_048_576
 
 
@@ -38,7 +40,8 @@ class FeishuSettings(BaseModel):
 class CodexSettings(BaseModel):
     bin: str = "codex"
     model: str = ""
-    timeout_seconds: float = 600.0
+    timeout_seconds: float = Field(default=600.0, gt=0, allow_inf_nan=False)
+    total_timeout_seconds: float = Field(default=1800.0, gt=0, allow_inf_nan=False)
 
 
 class VideoToolSettings(BaseModel):

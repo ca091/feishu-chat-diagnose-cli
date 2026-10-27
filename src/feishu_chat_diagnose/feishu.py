@@ -12,6 +12,7 @@ from .models import (
     AttachmentRef,
     ConversationCandidate,
     ConversationIdentity,
+    FetchResult,
     NormalizedMessage,
     Sender,
     TimeRange,
@@ -22,7 +23,6 @@ from .video_input import VIDEO_MIME_TYPES
 class FeishuGateway:
     def __init__(self, runner: LarkCliRunner) -> None:
         self.runner = runner
-        self.last_missing_message_ids: list[str] = []
 
     def search_groups(self, name: str) -> list[ConversationCandidate]:
         candidates: list[ConversationCandidate] = []
@@ -108,8 +108,7 @@ class FeishuGateway:
             participant_open_id=participant_open_id,
         )
 
-    def fetch_messages(self, chat_id: str, time_range: TimeRange) -> list[NormalizedMessage]:
-        self.last_missing_message_ids = []
+    def fetch_messages(self, chat_id: str, time_range: TimeRange) -> FetchResult:
         messages: dict[str, NormalizedMessage] = {}
         page_token = ""
         while True:
@@ -151,10 +150,10 @@ class FeishuGateway:
             incomplete_threads.update(self._expand_threads(messages, attempted_threads))
             if previous_attempts == (len(attempted_parents), len(attempted_threads)):
                 break
-        self.last_missing_message_ids = sorted(
-            (attempted_parents - messages.keys()) | incomplete_threads
+        return FetchResult(
+            messages=sorted(messages.values(), key=_message_sort_key),
+            missing_message_ids=sorted((attempted_parents - messages.keys()) | incomplete_threads),
         )
-        return sorted(messages.values(), key=_message_sort_key)
 
     def _expand_quote_parents(
         self, messages: dict[str, NormalizedMessage], attempted: set[str]

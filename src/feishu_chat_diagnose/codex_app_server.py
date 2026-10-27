@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import json
-import os
-import select
 import subprocess
 import sys
-import time
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any
 
 from pydantic import ValidationError
 
 from .attachments import MaterializedAttachment
+from .codex_protocol import JsonRpcTransport, StdioJsonRpcTransport, strict_json_schema
 from .errors import ModelOutputError
 from .models import Diagnosis, DiagnosisSkill, MessageBundle
 from .progress import ProgressEvent, ProgressLevel, ProgressSink
@@ -30,121 +27,6 @@ input is supplied, load and follow that Skill before investigating the issue. Us
 for relevant video evidence. The skills_used field must contain exactly the explicitly supplied
 Skill name, or an empty list when no Skill was supplied. Return only JSON matching the supplied
 schema."""
-
-
-class JsonRpcTransport(Protocol):
-    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]: ...
-    def notify(self, method: str, params: dict[str, Any]) -> None: ...
-    def events(self) -> Iterable[dict[str, Any]]: ...
-    def close(self) -> None: ...
-
-
-class StdioJsonRpcTransport:
-    def __init__(
-        self,
-        process: subprocess.Popen[str],
-        timeout_seconds: float = 600,
-        progress: ProgressSink | None = None,
-        heartbeat_seconds: float = 10,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self.process = process
-        self.timeout_seconds = timeout_seconds
-        self.progress = progress or (lambda event: None)
-        self.heartbeat_seconds = heartbeat_seconds
-        self.clock = clock
-        self._next_id = 1
-        self._pending: list[dict[str, Any]] = []
-        self._read_buffer = bytearray()
-
-    def set_progress(self, progress: ProgressSink | None) -> None:
-        self.progress = progress or (lambda event: None)
-
-    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        request_id = self._next_id
-        self._next_id += 1
-        self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-        while True:
-            message = self._read()
-            if message.get("id") != request_id:
-                self._pending.append(message)
-                continue
-            if "error" in message:
-                raise RuntimeError(f"Codex app-server {method} failed: {message['error']}")
-            return message.get("result", {})
-
-    def notify(self, method: str, params: dict[str, Any]) -> None:
-        self._write({"jsonrpc": "2.0", "method": method, "params": params})
-
-    def events(self) -> Iterable[dict[str, Any]]:
-        while self._pending:
-            yield self._pending.pop(0)
-        while True:
-            yield self._read()
-
-    def close(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-
-    def _write(self, message: dict[str, Any]) -> None:
-        if self.process.stdin is None:
-            raise RuntimeError("Codex app-server stdin is unavailable")
-        self.process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
-        self.process.stdin.flush()
-
-    def _read(self) -> dict[str, Any]:
-        if self.process.stdout is None:
-            raise RuntimeError("Codex app-server stdout is unavailable")
-        started = self.clock()
-        deadline = started + self.timeout_seconds
-        while True:
-            newline = self._read_buffer.find(b"\n")
-            if newline >= 0:
-                line = bytes(self._read_buffer[:newline])
-                del self._read_buffer[:newline + 1]
-                return json.loads(line)
-            now = self.clock()
-            remaining = deadline - now
-            if remaining <= 0:
-                self._emit(
-                    "ERROR", "codex.timeout",
-                    f"Codex 超过 {self.timeout_seconds:g} 秒未完成",
-                )
-                raise TimeoutError(
-                    f"Codex app-server did not respond within {self.timeout_seconds:g} seconds"
-                )
-            wait_seconds = min(self.heartbeat_seconds, remaining)
-            readable, _, _ = select.select(
-                [self.process.stdout], [], [], wait_seconds
-            )
-            if readable:
-                # Read bytes directly: TextIOWrapper.readline() both prefetches
-                # later messages and can block indefinitely on a partial line.
-                chunk = os.read(self.process.stdout.fileno(), 65536)
-                if chunk:
-                    self._read_buffer.extend(chunk)
-                    continue
-                if self._read_buffer:
-                    line = bytes(self._read_buffer)
-                    self._read_buffer.clear()
-                    return json.loads(line)
-                raise RuntimeError(f"Codex app-server exited with code {self.process.poll()}")
-            elapsed = self.clock() - started
-            self._emit(
-                "INFO", "codex.heartbeat",
-                f"Codex 正在执行，已等待 {elapsed:.0f} 秒",
-            )
-
-    def _emit(self, level: ProgressLevel, name: str, message: str) -> None:
-        try:
-            self.progress(ProgressEvent(level, name, message))
-        except Exception:
-            pass
 
 
 class CodexAppServerDiagnosis:
@@ -215,6 +97,7 @@ class CodexAppServerDiagnosis:
         video_base_url: str = "",
         video_timeout_seconds: float = 300,
         timeout_seconds: float = 600,
+        total_timeout_seconds: float = 1800,
         progress: ProgressSink | None = None,
     ) -> CodexAppServerDiagnosis:
         process = cls.start_process(
@@ -227,7 +110,10 @@ class CodexAppServerDiagnosis:
             video_timeout_seconds=video_timeout_seconds,
         )
         return cls(
-            StdioJsonRpcTransport(process, timeout_seconds, progress=progress),
+            StdioJsonRpcTransport(
+                process, timeout_seconds, progress=progress,
+                total_timeout_seconds=total_timeout_seconds,
+            ),
             model,
             progress=progress,
         )
@@ -441,28 +327,6 @@ class CodexAppServerDiagnosis:
             self.progress(ProgressEvent(level, name, message))
         except Exception:
             pass
-
-
-def strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Convert Pydantic output to the strict object shape required by Codex."""
-    result: dict[str, Any] = {}
-    for key, value in schema.items():
-        if key == "default":
-            continue
-        if isinstance(value, dict):
-            result[key] = strict_json_schema(value)
-        elif isinstance(value, list):
-            result[key] = [
-                strict_json_schema(item) if isinstance(item, dict) else item
-                for item in value
-            ]
-        else:
-            result[key] = value
-    properties = result.get("properties")
-    if isinstance(properties, dict):
-        result["additionalProperties"] = False
-        result["required"] = list(properties)
-    return result
 
 
 def _item_label(item_type: Any) -> str:

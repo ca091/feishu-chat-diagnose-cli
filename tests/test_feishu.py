@@ -85,9 +85,9 @@ def test_fetch_messages_pages_in_ascending_order(fake_runner, time_range) -> Non
         ]
     )
 
-    messages = FeishuGateway(fake_runner).fetch_messages("oc_group_a", time_range)
+    result = FeishuGateway(fake_runner).fetch_messages("oc_group_a", time_range)
 
-    assert [item.message_id for item in messages] == ["om_1", "om_2", "om_3"]
+    assert [item.message_id for item in result.messages] == ["om_1", "om_2", "om_3"]
     assert "--page-token" in fake_runner.calls[1]
 
 
@@ -123,8 +123,8 @@ def test_fetch_messages_expands_missing_quote_parent(fake_runner, time_range) ->
         {"items": [child], "has_more": False},
         {"items": [_raw_message("om_parent", "context", "1752559200000")]},
     ])
-    messages = FeishuGateway(fake_runner).fetch_messages("oc_group_a", time_range)
-    assert [item.message_id for item in messages] == ["om_parent", "om_child"]
+    result = FeishuGateway(fake_runner).fetch_messages("oc_group_a", time_range)
+    assert [item.message_id for item in result.messages] == ["om_parent", "om_child"]
     assert fake_runner.calls[1][0:2] == ["im", "+messages-mget"]
 
 
@@ -154,9 +154,9 @@ def test_fetch_messages_follows_nested_data_pagination(fake_runner, time_range) 
         {"data": {"messages": [second], "has_more": False, "page_token": ""}},
     ])
 
-    messages = FeishuGateway(fake_runner).fetch_messages("oc_group_a", time_range)
+    result = FeishuGateway(fake_runner).fetch_messages("oc_group_a", time_range)
 
-    assert [item.message_id for item in messages] == ["om_first", "om_second"]
+    assert [item.message_id for item in result.messages] == ["om_first", "om_second"]
     assert fake_runner.calls[1][-2:] == ["--page-token", "nested-next"]
 
 
@@ -186,13 +186,13 @@ def test_fetch_and_assemble_close_over_thread_quotes_and_connected_threads(fake_
     ])
     gateway = FeishuGateway(fake_runner)
 
-    messages = gateway.fetch_messages("oc_group_a", time_range)
-    selected = ConversationAssembler(max_messages=8).assemble(messages, keyword="bug")
+    result = gateway.fetch_messages("oc_group_a", time_range)
+    selected = ConversationAssembler(max_messages=8).assemble(result.messages, keyword="bug")
 
     assert {item.message_id for item in selected} == {
         "match", "root_a", "sibling_a", "linked", "ancestor", "root_b", "sibling_b", "external",
     }
-    assert gateway.last_missing_message_ids == []
+    assert result.missing_message_ids == []
     assert [args[1] for args in fake_runner.calls] == [
         "+chat-messages-list", "+threads-messages-list", "+threads-messages-list",
         "+messages-mget", "+messages-mget", "+threads-messages-list", "+messages-mget",
@@ -211,11 +211,11 @@ def test_thread_sibling_missing_quote_is_reported_without_retry(mocker, time_ran
     runner.run.side_effect = [{"items": [match]}, {"items": [sibling]}, parent_response]
     gateway = FeishuGateway(runner)
 
-    messages = gateway.fetch_messages("oc_group_a", time_range)
-    selected = ConversationAssembler(max_messages=2).assemble(messages, keyword="bug")
+    result = gateway.fetch_messages("oc_group_a", time_range)
+    selected = ConversationAssembler(max_messages=2).assemble(result.messages, keyword="bug")
 
     assert {item.message_id for item in selected} == {"match", "sibling"}
-    assert gateway.last_missing_message_ids == ["unavailable"]
+    assert result.missing_message_ids == ["unavailable"]
     assert runner.run.call_count == 3
     assert runner.run.call_args.args[0][0:2] == ["im", "+messages-mget"]
 
@@ -236,11 +236,11 @@ def test_partial_thread_failure_is_not_retried_after_new_quotes_are_fetched(mock
     ]
     gateway = FeishuGateway(runner)
 
-    messages = gateway.fetch_messages("oc_group_a", time_range)
-    selected = ConversationAssembler(max_messages=4).assemble(messages, keyword="bug")
+    result = gateway.fetch_messages("oc_group_a", time_range)
+    selected = ConversationAssembler(max_messages=4).assemble(result.messages, keyword="bug")
 
     assert {item.message_id for item in selected} == {"root", "match", "sibling", "parent"}
-    assert gateway.last_missing_message_ids == ["root"]
+    assert result.missing_message_ids == ["root"]
     assert runner.run.call_count == 4
 
 
@@ -252,10 +252,10 @@ def test_quote_obtained_from_thread_is_not_reported_as_missing(fake_runner, time
     ])
     gateway = FeishuGateway(fake_runner)
 
-    messages = gateway.fetch_messages("oc_group_a", time_range)
+    result = gateway.fetch_messages("oc_group_a", time_range)
 
-    assert {item.message_id for item in messages} == {"match", "parent"}
-    assert gateway.last_missing_message_ids == []
+    assert {item.message_id for item in result.messages} == {"match", "parent"}
+    assert result.missing_message_ids == []
     assert len(fake_runner.calls) == 3
 
 
@@ -268,12 +268,13 @@ def test_failed_context_is_retried_only_on_next_fetch(fake_runner, time_range) -
     ])
     gateway = FeishuGateway(fake_runner)
 
-    gateway.fetch_messages("oc_group_a", time_range)
-    assert gateway.last_missing_message_ids == ["parent"]
-    messages = gateway.fetch_messages("oc_group_a", time_range)
+    first = gateway.fetch_messages("oc_group_a", time_range)
+    assert first.missing_message_ids == ["parent"]
+    result = gateway.fetch_messages("oc_group_a", time_range)
 
-    assert {item.message_id for item in messages} == {"match", "parent"}
-    assert gateway.last_missing_message_ids == []
+    assert {item.message_id for item in result.messages} == {"match", "parent"}
+    assert result.missing_message_ids == []
+    assert first.missing_message_ids == ["parent"]
     assert len(fake_runner.calls) == 6
 
 
