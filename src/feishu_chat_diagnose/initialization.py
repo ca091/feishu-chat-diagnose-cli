@@ -31,6 +31,8 @@ def _migrate_configuration(source: Path) -> str:
         for section, key, command in (
             ("feishu", "lark_cli_bin", settings.feishu.lark_cli_bin),
             ("codex", "bin", settings.codex.bin),
+            ("video_local", "ffmpeg_bin", settings.video_local.ffmpeg_bin),
+            ("video_local", "ffprobe_bin", settings.video_local.ffprobe_bin),
         ):
             if section in document and key in document[section]:
                 document[section][key] = command

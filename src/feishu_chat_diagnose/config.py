@@ -44,6 +44,16 @@ class CodexSettings(BaseModel):
     total_timeout_seconds: float = Field(default=1800.0, gt=0, allow_inf_nan=False)
 
 
+class LocalVideoSettings(BaseModel):
+    ffmpeg_bin: str = "ffmpeg"
+    ffprobe_bin: str = "ffprobe"
+    max_frames: int = Field(default=24, gt=0, le=120)
+    max_dimension: int = Field(default=1280, ge=64, le=4096)
+    max_image_bytes: int = Field(default=16_777_216, gt=0)
+    decode_timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
+    timeout_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
+
+
 class VideoToolSettings(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
@@ -99,6 +109,7 @@ class Settings(BaseModel):
     defaults: DefaultsSettings = Field(default_factory=DefaultsSettings)
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     codex: CodexSettings = Field(default_factory=CodexSettings)
+    video_local: LocalVideoSettings = Field(default_factory=LocalVideoSettings)
     video_tool: VideoToolSettings = Field(default_factory=VideoToolSettings)
     repositories: dict[str, RepositorySettings] = Field(default_factory=dict)
 
@@ -162,6 +173,8 @@ def normalize_paths(settings: Settings, base: Path) -> Settings:
         repository.path = resolve_path(repository.path, base)
     settings.feishu.lark_cli_bin = resolve_executable(settings.feishu.lark_cli_bin, base)
     settings.codex.bin = resolve_executable(settings.codex.bin, base)
+    settings.video_local.ffmpeg_bin = resolve_executable(settings.video_local.ffmpeg_bin, base)
+    settings.video_local.ffprobe_bin = resolve_executable(settings.video_local.ffprobe_bin, base)
     return settings
 
 
@@ -187,6 +200,18 @@ def load_video_tool_settings(path: Path | None = None) -> VideoToolSettings:
         raise ConfigurationError(f"Invalid video configuration: {exc}") from exc
     settings.validate_runtime()
     return settings
+
+
+def load_video_runtime_settings(path: Path | None = None) -> Settings:
+    """Load only video/Codex sections; self-checks never validate repositories."""
+    config_path, payload = _read_config(path)
+    try:
+        settings = Settings.model_validate({
+            key: payload[key] for key in ("codex", "video_local", "video_tool") if key in payload
+        })
+    except ValueError as error:
+        raise ConfigurationError(f"Invalid video configuration: {error}") from None
+    return normalize_paths(settings, config_path.parent)
 
 
 def load_settings(path: Path | None = None, *, validate_repositories: bool = True) -> Settings:

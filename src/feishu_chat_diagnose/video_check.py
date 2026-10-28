@@ -58,7 +58,7 @@ def _sanitized_transport_logs() -> Iterator[None]:
         logger.removeFilter(redactor)
 
 
-def _parse_result(result: CallToolResult) -> VideoToolResult:
+def _parse_result(result: CallToolResult, source_message_id: str = SOURCE_MESSAGE_ID) -> VideoToolResult:
     text = "\n".join(item.text for item in result.content if isinstance(item, TextContent))
     if result.isError:
         raise VideoCheckError(f"understand_video 执行失败：{text or '未返回错误详情'}")
@@ -69,7 +69,7 @@ def _parse_result(result: CallToolResult) -> VideoToolResult:
             parsed = VideoToolResult.model_validate_json(text)
     except ValidationError:
         raise VideoCheckError("视频工具返回的结果不符合 VideoToolResult，未输出原始响应") from None
-    if parsed.source_message_id != SOURCE_MESSAGE_ID:
+    if parsed.source_message_id != source_message_id:
         raise VideoCheckError("视频工具返回的 source_message_id 不匹配")
     return parsed
 
@@ -86,6 +86,7 @@ async def check_video(
     path: Path,
     settings: VideoToolSettings,
     progress: ProgressSink | None = None,
+    *, source_message_id: str = SOURCE_MESSAGE_ID, question: str = QUESTION,
 ) -> VideoToolResult:
     """Call the real video MCP once, without Codex, Feishu, or case persistence."""
     source = validate_video(path)
@@ -149,8 +150,8 @@ async def check_video(
                                     "understand_video",
                                     arguments={
                                         "path": str(video.resolve()),
-                                        "source_message_id": SOURCE_MESSAGE_ID,
-                                        "question": QUESTION,
+                                        "source_message_id": source_message_id,
+                                        "question": question,
                                     },
                                     read_timeout_seconds=timedelta(seconds=settings.timeout_seconds),
                                     progress_callback=provider_progress,
@@ -160,7 +161,7 @@ async def check_video(
                             with suppress(asyncio.CancelledError):
                                 await heartbeat_task
                         stage = "校验视频结果"
-                        result = _parse_result(response)
+                        result = _parse_result(response, source_message_id)
                         stage = "关闭视频 MCP"
         emit("video_check.completed", "视频 MCP 调用完成，结果已通过结构校验，临时副本已清理")
         return result

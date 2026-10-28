@@ -151,6 +151,11 @@ class VideoToolResult(BaseModel):
     missing_information: list[str]
 
 
+class VideoUnderstandingResult(VideoToolResult):
+    backend: Literal["local", "mcp"]
+    fallback_reason: str = ""
+
+
 class CodeEvidence(BaseModel):
     path: str
     symbol: str = ""

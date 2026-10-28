@@ -188,7 +188,7 @@ def test_cli_json_over_real_stdio_without_feishu_codex_or_cases(
     for dependency in ("build_runtime", "CodexAppServerDiagnosis.launch", "LarkCliRunner.run", "CaseStore"):
         mocker.patch(f"feishu_chat_diagnose.cli.{dependency}", side_effect=AssertionError("video-check must be independent"))
     monkeypatch.chdir(local_video.parent)
-    result = CliRunner().invoke(app, ["video-check", local_video.name, "--config", str(video_config), "--json"])
+    result = CliRunner().invoke(app, ["video-check", "--backend", "mcp", local_video.name, "--config", str(video_config), "--json"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
@@ -233,7 +233,7 @@ def test_stalled_api_reports_stage_and_heartbeat_before_timeout(mcp_server, loca
 
 def test_cli_error_is_redacted_and_stdout_empty(video_config, local_video, mcp_server, monkeypatch):
     monkeypatch.setenv("VIDEO_CHECK_TEST_MODE", "error")
-    result = CliRunner().invoke(app, ["video-check", str(local_video), "--config", str(video_config), "--json"])
+    result = CliRunner().invoke(app, ["video-check", "--backend", "mcp", str(local_video), "--config", str(video_config), "--json"])
 
     assert result.exit_code == 1
     assert result.stdout == ""
@@ -249,7 +249,7 @@ def test_malformed_stdio_does_not_expose_raw_payload(
 ):
     monkeypatch.setenv("VIDEO_CHECK_TEST_MODE", "protocol_noise")
     monkeypatch.setattr(video_check, "STARTUP_TIMEOUT_SECONDS", 2)
-    result = CliRunner().invoke(app, ["video-check", str(local_video), "--config", str(video_config), "--json"])
+    result = CliRunner().invoke(app, ["video-check", "--backend", "mcp", str(local_video), "--config", str(video_config), "--json"])
 
     # The SDK tolerates an unrelated malformed stdout line; the real tool
     # response must still be valid, and its parse diagnostics must be safe.
@@ -267,7 +267,7 @@ def test_cli_plain_output_and_result_redaction(video_config, local_video, mocker
         missing_information=["缺少日志"],
     )
     mocker.patch("feishu_chat_diagnose.cli.check_video", new=mocker.AsyncMock(return_value=result))
-    output = CliRunner().invoke(app, ["video-check", str(local_video), "--config", str(video_config)])
+    output = CliRunner().invoke(app, ["video-check", "--backend", "mcp", str(local_video), "--config", str(video_config)])
 
     assert output.exit_code == 0
     assert "qwen-test" in output.stdout and "耗时" in output.stdout
@@ -282,13 +282,13 @@ def test_cli_json_redacts_results_without_breaking_json(video_config, local_vide
         observations=[], missing_information=[],
     )
     mocker.patch("feishu_chat_diagnose.cli.check_video", new=mocker.AsyncMock(return_value=response))
-    output = CliRunner().invoke(app, ["video-check", str(local_video), "--config", str(video_config), "--json"])
+    output = CliRunner().invoke(app, ["video-check", "--backend", "mcp", str(local_video), "--config", str(video_config), "--json"])
     assert output.exit_code == 0
     assert json.loads(output.stdout)["summary"] == '[REDACTED] and "quotes"'
 
 
 def test_missing_video_config_explains_init(diagnose_home, local_video):
-    result = CliRunner().invoke(app, ["video-check", str(local_video), "--json"])
+    result = CliRunner().invoke(app, ["video-check", "--backend", "mcp", str(local_video), "--json"])
     assert result.exit_code == 1
     assert result.stdout == "" and "feishu-diagnose init" in result.stderr
 
@@ -303,7 +303,7 @@ def test_invalid_file_fails_before_subprocess(video_config, tmp_path, mocker, ki
         mocker.patch("feishu_chat_diagnose.cli.load_video_tool_settings", return_value=VideoToolSettings())
     spawn = mocker.patch.object(video_check, "stdio_client", side_effect=AssertionError("must not spawn"))
 
-    result = CliRunner().invoke(app, ["video-check", str(path), "--config", str(video_config), "--json"])
+    result = CliRunner().invoke(app, ["video-check", "--backend", "mcp", str(path), "--config", str(video_config), "--json"])
 
     assert result.exit_code == 2, result.output
     assert result.stdout == ""
@@ -313,7 +313,7 @@ def test_invalid_file_fails_before_subprocess(video_config, tmp_path, mocker, ki
 
 def test_cli_interrupt_returns_130(video_config, local_video, mocker):
     mocker.patch("feishu_chat_diagnose.cli.check_video", new=mocker.AsyncMock(side_effect=KeyboardInterrupt))
-    result = CliRunner().invoke(app, ["video-check", str(local_video), "--config", str(video_config)])
+    result = CliRunner().invoke(app, ["video-check", "--backend", "mcp", str(local_video), "--config", str(video_config)])
     assert result.exit_code == 130
     assert "已中断" in result.stderr
 
@@ -345,7 +345,7 @@ def test_invalid_video_config_fails_before_subprocess(tmp_path, monkeypatch, moc
     config = tmp_path / "config.toml"
     config.write_text(content, encoding="utf-8")
     check = mocker.patch("feishu_chat_diagnose.cli.check_video")
-    result = CliRunner().invoke(app, ["video-check", "unused.mp4", "--config", str(config), "--json"])
+    result = CliRunner().invoke(app, ["video-check", "--backend", "mcp", "unused.mp4", "--config", str(config), "--json"])
 
     assert result.exit_code == 1
     assert expected in result.stderr
@@ -359,7 +359,7 @@ def test_invalid_video_content_fails_before_subprocess(video_config, tmp_path, m
     with path.open("wb") as handle:
         handle.truncate(7_499_998 if kind == "oversized" else 10)
     spawn = mocker.patch.object(video_check, "stdio_client")
-    result = CliRunner().invoke(app, ["video-check", str(path), "--config", str(video_config), "--json"])
+    result = CliRunner().invoke(app, ["video-check", "--backend", "mcp", str(path), "--config", str(video_config), "--json"])
     assert result.exit_code == 2 and result.stdout == ""
     assert ("请先压缩" if kind == "oversized" else "扩展名") in result.stderr
     spawn.assert_not_called()
@@ -404,7 +404,7 @@ def test_real_video_mcp_calls_compatible_http_endpoint(tmp_path, local_video, mo
             'timeout_seconds=10\n', encoding="utf-8",
         )
         try:
-            output = CliRunner().invoke(app, ["video-check", str(local_video), "--config", str(config), "--json"])
+            output = CliRunner().invoke(app, ["video-check", "--backend", "mcp", str(local_video), "--config", str(config), "--json"])
         finally:
             server.shutdown()
             thread.join(timeout=5)

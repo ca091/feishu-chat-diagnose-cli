@@ -17,6 +17,7 @@ class JsonRpcTransport(Protocol):
     def notify(self, method: str, params: dict[str, Any]) -> None: ...
     def events(self) -> Iterable[dict[str, Any]]: ...
     def close(self) -> None: ...
+    def set_request_handler(self, handler: Callable[[str, dict[str, Any]], dict[str, Any]]) -> None: ...
 
 
 class StdioJsonRpcTransport:
@@ -39,6 +40,22 @@ class StdioJsonRpcTransport:
         self._next_id = 1
         self._pending: deque[dict[str, Any]] = deque()
         self._read_buffer = bytearray()
+        self._request_handler: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
+
+    def set_request_handler(self, handler: Callable[[str, dict[str, Any]], dict[str, Any]]) -> None:
+        self._request_handler = handler
+
+    def remaining_seconds(self) -> float:
+        now = self.clock()
+        return self._check_total_deadline(now) - now
+
+    def _dispatch_request(self, message: dict[str, Any]) -> bool:
+        if "id" not in message or "method" not in message or self._request_handler is None:
+            return False
+        result = self._request_handler(message["method"], message.get("params", {}))
+        self._check_total_deadline(self.clock())
+        self._write({"jsonrpc": "2.0", "id": message["id"], "result": result})
+        return True
 
     def set_progress(self, progress: ProgressSink | None) -> None:
         self.progress = progress or (lambda event: None)
@@ -52,7 +69,9 @@ class StdioJsonRpcTransport:
         self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         while True:
             message = self._read(deadline)
-            if message.get("id") != request_id:
+            if self._dispatch_request(message):
+                continue
+            if "method" in message or message.get("id") != request_id:
                 self._pending.append(message)
                 continue
             if "error" in message:
@@ -65,9 +84,13 @@ class StdioJsonRpcTransport:
     def events(self) -> Iterable[dict[str, Any]]:
         while self._pending:
             self._check_total_deadline(self.clock())
-            yield self._pending.popleft()
+            message = self._pending.popleft()
+            if not self._dispatch_request(message):
+                yield message
         while True:
-            yield self._read()
+            message = self._read()
+            if not self._dispatch_request(message):
+                yield message
 
     def close(self) -> None:
         if self.process.poll() is None:

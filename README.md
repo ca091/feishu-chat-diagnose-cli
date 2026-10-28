@@ -71,7 +71,7 @@ im:message.group_msg:get_as_user im:message.p2p_msg:get_as_user
 contact:user.base:readonly
 ```
 
-视频理解使用阿里模型，默认 `qwen3-vl-plus`（关闭深度思考）；需开通对应模型并按所用服务计费。在全局配置 `~/.feishu-diagnose/config.toml` 中填写自己的 Key：
+视频默认使用本地 `ffmpeg`/`ffprobe` 抽帧，再交给配置的 Codex 模型理解图片；本地指解码在本机执行，图片仍发送给 Codex。请先安装这两个工具（macOS 可用 `brew install ffmpeg`）。本地失败后才使用视频 MCP 与阿里模型 `qwen3-vl-plus`；需要回退能力时，在 `~/.feishu-diagnose/config.toml` 中配置：
 
 ```toml
 [video_tool]
@@ -103,27 +103,42 @@ feishu-diagnose resume <case-id>
 
 ### 独立验证视频工具
 
-`video-check` 会把指定视频以 Base64 发送到配置的兼容接口，通过项目现有的视频 MCP 调用 `understand_video`，输出中文摘要、带时间点的观察及缺失信息。无需启动 Codex、登录飞书或配置仓库与 Skill，也不创建 case。
+`video-check` 独立验证视频理解，不调用飞书、不读取项目或 Skill、不创建 case。
 
 ```bash
-feishu-diagnose video-check /path/to/test.mp4
+feishu-diagnose video-check /path/to/test.mp4                   # 本地优先，失败回退 MCP
+feishu-diagnose video-check /path/to/test.mp4 --backend local   # 只验证无 MCP 路径
+feishu-diagnose video-check /path/to/test.mp4 --backend mcp     # 只验证现有视频 MCP
 feishu-diagnose video-check /path/to/test.mp4 --json
-feishu-diagnose video-check /path/to/test.mp4 --config /path/to/config.toml
 ```
 
-命令仅校验 `[video_tool]`，配置路径和 Key 优先级与其他命令相同。输入须为可读、非空的普通文件，支持 MP4、M4V、MOV、AVI、MKV、FLV、WMV 和 WebM；内容是否有效由服务判断。Base64 编码后须小于 10 MB（原文件约小于 7.5 MB），超限在请求前提示压缩；建议使用内容已知且至少 2 秒的短 MP4。原文件保持不变，调用使用的临时副本会在成功、失败或中断后清理。本工具不创建独立的远端文件资源；服务端对请求内容的保存策略以服务提供方约定为准。当前兼容网关的原生上传能力未经确认，暂不支持 100 MB 视频，不自动压缩或本地抽帧。此视觉模型不理解视频音轨。
+```mermaid
+flowchart LR
+    VIDEO[视频] --> LOCAL[ffmpeg 抽帧 + 隔离 Codex 图片理解]
+    LOCAL -- 成功 --> RESULT[带时间点的观察结果]
+    LOCAL -- 失败 --> MCP[视频 MCP + 阿里模型]
+    MCP -- 成功 --> RESULT
+    MCP -- 失败 --> MISSING[报告视频证据缺失]
+```
 
-MCP 初始化及工具发现限时 30 秒，工具调用使用 `video_tool.timeout_seconds`，须为有限正数，默认 300 秒。HTTP 请求也显式使用此超时，工具端和命令端均限制调用总时长，不自动重试。终端会显示检查编码、发送视频并请求模型理解、校验结果三个阶段；上传与生成共用一个 HTTP 请求，不能独立观测服务端进度。等待期间每 10 秒显示当前阶段及已等待时长，进度通知不会延长调用总时限。超时错误会保留最近阶段，便于定位。同一诊断内，同一来源视频的并发调用只发送一次请求；超时或取消会关闭本地 HTTP 请求并缓存失败，避免再次调用重复发送。显式 `resume` 会创建新的视频 MCP，允许重新诊断。关闭连接不代表服务端已经停止处理或撤销计费。
+| 方式 | 配置与边界 |
+| --- | --- |
+| 本地（默认优先） | 使用 `[codex]` 与 `[video_local]`；无需 MCP Key。约每秒一帧，长视频均匀采样，默认最多 24 帧、最长边 1280 像素、图片合计 16 MiB；解码限时 30 秒，抽帧与理解合计 120 秒 |
+| MCP（失败后回退） | 使用 `[video_tool]`，默认请求上限 300 秒；初始化与工具发现上限 30 秒，同时受当前诊断剩余时间约束。Base64 须小于 10 MB（原视频约小于 7.5 MB） |
 
-进度与错误写入 stderr，默认结果以文本写入 stdout；`--json` 时 stdout 只包含 `VideoToolResult` JSON（`source_message_id` 固定为 `video-check`），失败时为空。参数错误、执行失败、用户中断的退出码分别为 `2`、`1`、`130`，成功为 `0`。输出会对 Key 脱敏，不保存原始模型响应。
+支持 MP4、M4V、MOV、AVI、MKV、FLV、WMV 和 WebM。缺少本地依赖、解码失败、超时、响应无效或模型明确无法读取画面时回退；没发现 bug 或业务信息不足不触发回退。取消、路径越界和诊断总时限到期不触发回退。同一诊断内同一视频的成功或失败结果会缓存，避免重复调用；`resume` 使用新的缓存。两种方式均不理解音轨，抽样观察不代表检查了全部视频帧。
+
+原视频保持不变，临时视频副本和帧图片在成功、失败、取消后清理。诊断仓库继续只读，抽帧由 CLI 在专用临时目录执行。`auto`/`local` 仅加载 Codex 和视频配置，不校验仓库；`--backend mcp` 仍无需 Codex，仅校验 MCP 配置。本地成功时不启动备用视频 MCP，也不检查其凭据。
+
+进度和错误写入 stderr，结果写入 stdout。`--json` 输出摘要、时间点观察及缺失信息；`auto`/`local` 还包含 `backend` 和 `fallback_reason`。自检来源 ID 固定为 `video-check`。参数错误、执行失败、中断、成功的退出码分别为 `2`、`1`、`130`、`0`。不保存原始模型响应。
 
 | 命令 | 验证范围 |
 | --- | --- |
-| `doctor` | 配置、凭据是否存在、飞书授权及 Codex app-server 初始化；不实际调用视频模型 |
-| `video-check` | 视频 MCP 启动、工具发现、视频发送、阿里模型理解及结果结构校验 |
-| 含视频的 `analyze` | 飞书下载、Codex 调用视频工具及仓库诊断的完整链路 |
+| `doctor` | 配置、飞书授权、Codex 初始化，以及本地依赖和备用 MCP 凭据；不实际调用视频模型 |
+| `video-check` | 按指定方式验证视频理解与结果结构；默认验证本地优先和 MCP 回退 |
+| 含视频的 `analyze` | 飞书下载、统一客户端视频工具、视频观察与仓库诊断 |
 
-自检成功表示工具调用完成且结果通过结构校验，仍需对照录屏确认摘要和时间点是否准确。
+自检成功表示执行完成且结果结构有效；请对照内容已知的录屏检查观察是否准确。
 
 ### 诊断与恢复
 
@@ -159,6 +174,8 @@ MCP 初始化及工具发现限时 30 秒，工具调用使用 `video_tool.timeo
 ```
 
 消息拉取会交替补全引用父消息和关联话题，直到没有尚未尝试的关联；话题新增消息的引用也会继续补全，因此上下文可能超出所选时间范围。同一次拉取中，每个引用目标和话题只补全一次（话题接口会分页），失败项会显示在缺失提示中。
+
+合并转发的会话记录（含嵌套转发）会保留展开后的正文，并识别其中的图片、视频和文件附件；用户确认后才下载。视频通过本地优先、MCP 回退的统一工具理解，UTF-8 文本文件（如 `.txt`、`.log`、`.json`、`.md`）读取正文；其他文件保留附件记录，不提取正文。
 
 `--keyword` 按消息正文筛选，并保留关联引用链和话题。`defaults.max_messages` 限制最终组装的消息数；超限会报错，不会截断上下文。
 
@@ -213,7 +230,7 @@ flowchart TD
     PARTIAL -- "是" --> READY{"确认使用不完整附件继续？"}
     READY -- "否" --> CANCEL
     READY -- "是" --> CREATE
-    CREATE --> CODEX["独立诊断 Codex：只读检查仓库，可调用视频 MCP"]
+    CREATE --> CODEX["独立诊断 Codex：只读检查仓库；视频本地优先，MCP 回退"]
     CODEX --> REPORT["保存 diagnosis.json 和 report.md，终端展示报告"]
     REPO -. "失败" .-> EARLY_ERROR
     SKILL -. "评估执行失败" .-> EARLY_ERROR
@@ -233,12 +250,12 @@ flowchart TD
 
 ## 数据与边界
 
-case 默认保存在 `~/.feishu-diagnose/cases/<case-id>/`，其中可能包含私聊正文，请勿提交或公开分享。图片、视频和普通附件只存在于运行期临时目录，结束后删除。诊断时，阿里模型作为 Codex 可调用的原始视频理解工具，最终问题归因和仓库分析只由同一个 Codex turn 完成；`video-check` 则独立验证视频工具，不进行仓库归因。
+case 默认保存在 `~/.feishu-diagnose/cases/<case-id>/`，其中可能包含私聊正文，请勿提交或公开分享。图片、视频和普通附件只存在于运行期临时目录，结束后删除。诊断时，CLI 优先本地抽帧并交给独立、无工具和 MCP 的 Codex 会话生成视频观察，失败后才调用阿里模型视频 MCP；最终问题归因和仓库分析仍由同一个诊断 Codex turn 完成；`video-check` 则独立验证视频工具，不进行仓库归因。
 
 首版不提供机器人、消息监听、飞书回复、代码修改、提交或推送，也没有自动重试。
 
 ## 手工冒烟测试
 
-先用一段内容已知的短录屏运行 `video-check`，对照检查摘要与时间点；用 `--json` 确认结果可解析。然后准备一个测试群，发送一段问题文本、一张截图和一个 MP4；将对应测试仓库加入配置，并填写清楚项目描述。运行 `doctor`，再用较短的 `--since` 执行 `analyze`。确认报告包含聊天事实、视频时间点和仓库代码证据，并检查 case 目录中没有残留图片或视频。
+先用一段内容已知的短录屏运行 `video-check --backend local`，对照摘要与时间点；再用 `--backend mcp` 验证备用工具。将 `video_local.ffmpeg_bin` 临时指向不存在的命令后运行默认 `video-check`，确认失败后回退 MCP；用 `--json` 检查 backend 和结果可解析。然后准备一个测试群，发送一段问题文本、一张截图和一个 MP4；将对应测试仓库加入配置，并填写清楚项目描述。运行 `doctor`，再用较短的 `--since` 执行 `analyze`。确认报告包含聊天事实、视频时间点和仓库代码证据，并检查 case 目录中没有残留图片或视频。
 
 再分别检查无关聊天、仅讨论排期的需求、信息不足的讨论：应只输出总结及原因，不新增 case 或下载附件。混合聊天应只诊断代码相关话题及必要上下文；需要检查实现的需求应进入代码分析。指定仅适合 bug 的 Skill 时，需求分析应说明跳过原因；检查无消息、前置失败和两次确认中取消的情况，均不应新增 case 或执行日志。进入代码诊断后若失败，对该 case 执行 `resume`，确认沿用已保存的分流和 Skill 决定。

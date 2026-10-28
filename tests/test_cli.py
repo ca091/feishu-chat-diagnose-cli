@@ -21,15 +21,17 @@ def test_help_lists_operator_commands_before_initialization(diagnose_home) -> No
     assert not diagnose_home.exists()
 
 
-def test_doctor_reports_missing_video_key_without_traceback(monkeypatch) -> None:
+def test_doctor_accepts_local_tools_without_mcp_credentials(monkeypatch, mocker) -> None:
     monkeypatch.setattr("feishu_chat_diagnose.cli.load_settings", lambda config: Settings())
     monkeypatch.setattr("feishu_chat_diagnose.cli.subprocess.run", lambda *args, **kwargs: None)
     monkeypatch.setattr("feishu_chat_diagnose.cli.LarkCliRunner.run", lambda *args, **kwargs: {})
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    mocker.patch("feishu_chat_diagnose.cli.CodexAppServerDiagnosis.launch")
 
     result = CliRunner().invoke(app, ["doctor"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0
+    assert "local video tools: ready" in result.output
     assert "DASHSCOPE_API_KEY or video_tool.api_key" in result.output
     assert "Traceback" not in result.output
 

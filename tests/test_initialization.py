@@ -84,6 +84,9 @@ model = "custom-model"
 lark_cli_bin = "lark-cli"
 [video_tool]
 model = "video-model"
+[video_local]
+ffmpeg_bin = "./tools/ffmpeg"
+ffprobe_bin = "./tools/ffprobe"
 [extension]
 unknown = "keep me"
 '''
@@ -106,6 +109,8 @@ unknown = "keep me"
     assert settings.codex.bin == str(project / "tools/codex")
     assert settings.codex.model == "custom-model"
     assert settings.video_tool.model == "video-model"
+    assert settings.video_local.ffmpeg_bin == str(project / "tools/ffmpeg")
+    assert settings.video_local.ffprobe_bin == str(project / "tools/ffprobe")
     assert settings.feishu.lark_cli_bin == "lark-cli"
     assert not list((diagnose_home / "cases").iterdir())
     assert source.read_text() == original

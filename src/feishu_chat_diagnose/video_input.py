@@ -35,14 +35,15 @@ def validate_video_size(size: int) -> None:
         raise VideoInputError("视频过大：Base64 编码后须小于 10 MB（原文件约小于 7.5 MB），请先压缩视频")
 
 
-def validate_video(path: Path) -> Path:
+def validate_video(path: Path, *, enforce_size_limit: bool = True) -> Path:
     try:
         canonical = path.expanduser().resolve()
         if not canonical.is_file():
             raise VideoInputError("视频路径必须是已存在的普通文件")
         if canonical.suffix.lower() not in VIDEO_MIME_TYPES:
             raise VideoInputError("不支持的视频扩展名；请使用 MP4、MOV、AVI、MKV、FLV、WMV 或 WebM")
-        validate_video_size(canonical.stat().st_size)
+        if enforce_size_limit:
+            validate_video_size(canonical.stat().st_size)
         with canonical.open("rb") as handle:
             if not handle.read(1):
                 raise VideoInputError("视频文件不能为空")

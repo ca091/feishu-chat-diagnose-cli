@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -13,7 +14,7 @@ import typer
 
 from .case_store import CaseStore
 from .codex_app_server import CodexAppServerDiagnosis
-from .config import Settings, load_settings, load_video_tool_settings
+from .config import Settings, load_settings, load_video_runtime_settings, load_video_tool_settings
 from .errors import ConfigurationError
 from .feishu import FeishuGateway
 from .initialization import initialize
@@ -23,6 +24,8 @@ from .orchestrator import AnalyzeRequest, DiagnosisOrchestrator
 from .progress import ProgressEvent, ProgressSink, redact_secrets, sanitize_message
 from .time_range import resolve_time_range
 from .video_check import VideoInputError, check_video
+from .video_input import validate_video
+from .video_tool import VideoUnderstandingService
 from .triage import CodexTriageService
 
 app = typer.Typer(no_args_is_help=True, help="Diagnose Feishu discussions against a local repository.")
@@ -61,7 +64,7 @@ def init() -> None:
     else:
         typer.echo("已生成带注释的配置模板。")
     typer.echo(f"配置文件：{result.config_path}\n默认案例目录：{result.case_directory}")
-    typer.echo("请编辑配置中的仓库、Skill 和视频模型，完成授权并填写 video_tool.base_url、api_key（或设置 DASHSCOPE_API_KEY） 后运行 feishu-diagnose doctor。")
+    typer.echo("请配置仓库和 Skill，完成 Codex、飞书授权并安装 ffmpeg/ffprobe 后运行 feishu-diagnose doctor。video_tool 中的模型和 Key 用于可选的 MCP 回退。")
     if os.environ.get("FEISHU_DIAGNOSE_CONFIG"):
         typer.echo("提示：FEISHU_DIAGNOSE_CONFIG 已设置，普通命令仍优先使用它；init 始终初始化全局位置。")
 
@@ -81,6 +84,7 @@ def build_runtime(
             video_timeout_seconds=settings.video_tool.timeout_seconds,
             timeout_seconds=settings.codex.timeout_seconds,
             total_timeout_seconds=settings.codex.total_timeout_seconds,
+            local_video_settings=settings.video_local,
         )
 
     return DiagnosisOrchestrator(
@@ -200,11 +204,12 @@ def _display_triage(result: DiscussionTriage, settings: Settings) -> None:
 
 @app.command("video-check")
 def video_check(
-    video: Annotated[Path, typer.Argument(help="Local video to upload and understand")],
+    video: Annotated[Path, typer.Argument(help="Local video to understand")],
     config: Annotated[Path | None, typer.Option("--config")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Print only the result JSON to stdout")] = False,
+    backend: Annotated[str, typer.Option(help="Video backend: auto, local, or mcp")] = "auto",
 ) -> None:
-    """通过视频 MCP 和阿里模型检查本地视频；无需 Codex 或飞书。"""
+    """检查视频理解；默认本地优先、失败后回退 MCP，不创建 case。"""
     secrets: tuple[str, ...] = ()
     started = time.monotonic()
 
@@ -212,14 +217,33 @@ def video_check(
         _render_progress(ProgressEvent(event.level, event.name, sanitize_message(event.message, secrets)))
 
     try:
-        settings = load_video_tool_settings(config)
-        secrets = (settings.api_key.get_secret_value(), settings.resolve_api_key())
-        result = asyncio.run(check_video(video, settings, progress))
+        if backend not in {"auto", "local", "mcp"}:
+            raise typer.BadParameter("须为 auto、local 或 mcp", param_hint="--backend")
+        if backend == "mcp":
+            settings = load_video_tool_settings(config)
+            secrets = (settings.api_key.get_secret_value(), settings.resolve_api_key())
+            result = asyncio.run(check_video(video, settings, progress))
+            label = f"MCP / {settings.model}"
+        else:
+            settings = load_video_runtime_settings(config)
+            secrets = (settings.video_tool.api_key.get_secret_value(), settings.video_tool.resolve_api_key())
+            source = validate_video(video, enforce_size_limit=False)
+            with tempfile.TemporaryDirectory(prefix="feishu-video-check-") as directory:
+                root = Path(directory)
+                copy = root / ("video" + source.suffix)
+                shutil.copyfile(source, copy)
+                result = VideoUnderstandingService(
+                    root, settings.video_local, settings.codex, settings.video_tool, progress,
+                ).understand_video(copy, "video-check", "请用中文概括可见操作、现象和异常，并按时间点列出观察。", backend=backend)
+            label = (f"MCP / {settings.video_tool.model}" if result.backend == "mcp"
+                     else f"本地抽帧 + Codex / {settings.codex.model or '默认模型'}")
     except KeyboardInterrupt:
         typer.echo("视频自检已中断", err=True)
         raise typer.Exit(code=130) from None
     except VideoInputError as error:
         raise typer.BadParameter(sanitize_message(str(error), secrets), param_hint="VIDEO") from None
+    except typer.BadParameter:
+        raise
     except Exception as error:
         typer.echo(f"Error: {sanitize_message(str(error), secrets)[:1500]}", err=True)
         raise typer.Exit(code=1) from None
@@ -238,7 +262,7 @@ def video_check(
     if json_output:
         typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
         return
-    typer.echo(f"视频自检通过（模型：{sanitize_message(settings.model, secrets)}，耗时：{time.monotonic() - started:.1f} 秒）")
+    typer.echo(f"视频自检通过（{sanitize_message(label, secrets)}，耗时：{time.monotonic() - started:.1f} 秒）")
     typer.echo(f"\n摘要：{payload['summary']}")
     typer.echo("\n时间点观察：")
     for item in payload["observations"]:
@@ -272,12 +296,24 @@ def doctor(config: Annotated[Path | None, typer.Option("--config")] = None) -> N
         " ".join(REQUIRED_FEISHU_SCOPES), "--json",
     ])
     typer.echo("feishu authorization: ok")
+    local_ready = True
+    for executable in (settings.video_local.ffmpeg_bin, settings.video_local.ffprobe_bin):
+        try:
+            subprocess.run([executable, "-version"], check=True, capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            local_ready = False
+    typer.echo(f"local video tools: {'ready' if local_ready else 'unavailable (ffmpeg/ffprobe)'}")
+    mcp_ready = True
     try:
         settings.video_tool.validate_runtime()
     except ConfigurationError as error:
-        typer.echo(f"Error: {error}", err=True)
+        mcp_ready = False
+        typer.echo(f"video MCP fallback: unavailable ({error})")
+    else:
+        typer.echo("video provider credentials: present (MCP fallback)")
+    if not local_ready and not mcp_ready:
+        typer.echo("Error: 本地视频工具和 MCP 回退均不可用", err=True)
         raise typer.Exit(code=1) from None
-    typer.echo("video provider credentials: present")
     with tempfile.TemporaryDirectory(prefix="feishu-doctor-") as directory:
         codex = CodexAppServerDiagnosis.launch(
             Path(directory), codex_bin=settings.codex.bin, model=settings.codex.model,
@@ -286,10 +322,12 @@ def doctor(config: Annotated[Path | None, typer.Option("--config")] = None) -> N
             video_base_url=settings.video_tool.base_url,
             video_timeout_seconds=settings.video_tool.timeout_seconds,
             timeout_seconds=settings.codex.timeout_seconds,
+            local_video_settings=settings.video_local,
         )
         try:
             codex.transport.request(
-                "initialize", {"clientInfo": {"name": "feishu-diagnose-doctor", "version": "0.1.0"}}
+                "initialize", {"clientInfo": {"name": "feishu-diagnose-doctor", "version": "0.1.0"},
+                               "capabilities": {"experimentalApi": True}}
             )
             codex.transport.notify("initialized", {})
         finally:

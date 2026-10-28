@@ -55,6 +55,9 @@ class FakeTransport:
     def set_progress(self, progress) -> None:
         self.progress = progress
 
+    def set_request_handler(self, handler) -> None:
+        self.request_handler = handler
+
 
 @pytest.fixture
 def bundle() -> MessageBundle:
@@ -161,11 +164,10 @@ def test_invalid_final_json_is_not_retried(tmp_path: Path, bundle) -> None:
 
 
 @pytest.mark.parametrize("environment_key", [None, "environment-video-key"])
-def test_launch_passes_key_only_via_child_environment(
+def test_launch_defers_mcp_and_keeps_video_key_out_of_diagnostic_process(
     tmp_path, monkeypatch, mocker, environment_key
 ) -> None:
     import os
-    import tomllib
 
     if environment_key is None:
         monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
@@ -174,7 +176,7 @@ def test_launch_passes_key_only_via_child_environment(
     popen = mocker.patch("feishu_chat_diagnose.codex_app_server.subprocess.Popen")
     mocker.patch("feishu_chat_diagnose.codex_app_server.StdioJsonRpcTransport")
 
-    CodexAppServerDiagnosis.launch(
+    codex = CodexAppServerDiagnosis.launch(
         tmp_path, video_model="qwen3-vl-plus", video_api_key="configured-video-key",
         video_timeout_seconds=123, video_base_url="https://gateway.example/compatible-mode/v1",
     )
@@ -182,20 +184,48 @@ def test_launch_passes_key_only_via_child_environment(
     argv = popen.call_args.args[0]
     child_env = popen.call_args.kwargs["env"]
     assert argv[:2] == ["codex", "app-server"]
-    assert "mcp_servers.feishu_video.required=true" in argv
-    assert child_env["DASHSCOPE_API_KEY"] == (environment_key or "configured-video-key")
+    assert argv == ["codex", "app-server", "--stdio"]
+    assert "DASHSCOPE_API_KEY" not in child_env
+    assert codex.video_service.mcp_settings.resolve_api_key() == (environment_key or "configured-video-key")
     assert os.environ.get("DASHSCOPE_API_KEY") == environment_key
     assert "configured-video-key" not in " ".join(argv)
     assert "environment-video-key" not in " ".join(argv)
-    forwarding = tomllib.loads(next(arg for arg in argv if ".env_vars=" in arg))
-    names = forwarding["mcp_servers"]["feishu_video"]["env_vars"]
-    assert {name: child_env[name] for name in names} == {
-        "DASHSCOPE_API_KEY": environment_key or "configured-video-key",
-        "FEISHU_DIAGNOSE_MEDIA_ROOT": str(tmp_path.resolve()),
-        "FEISHU_DIAGNOSE_VIDEO_MODEL": "qwen3-vl-plus",
-        "FEISHU_DIAGNOSE_VIDEO_BASE_URL": "https://gateway.example/compatible-mode/v1",
-        "FEISHU_DIAGNOSE_VIDEO_TIMEOUT": "123",
-    }
+    assert codex.video_service.mcp_settings.timeout_seconds == 123
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_native_video_tool_enforces_attachment_scope_and_records_failure(tmp_path, bundle, mocker, fails):
+    from feishu_chat_diagnose.models import VideoUnderstandingResult
+    from feishu_chat_diagnose.video_tool import VideoUnderstandingError
+
+    transport = FakeTransport()
+    service = mocker.Mock()
+    service.understand_video.return_value = VideoUnderstandingResult(
+        source_message_id="om_video", summary="录屏", observations=[], missing_information=[], backend="local",
+    )
+    if fails:
+        service.understand_video.side_effect = VideoUnderstandingError("本地和 MCP 均失败")
+    attachments = materialized(tmp_path)
+    responses = []
+    original_events = transport.events
+
+    def events():
+        arguments = {"path": str(attachments[1].local_path), "source_message_id": "wrong", "question": "看画面"}
+        responses.append(transport.request_handler("item/tool/call", {"tool": "understand_video", "arguments": arguments}))
+        service.understand_video.assert_not_called()
+        arguments["source_message_id"] = "om_video"
+        responses.append(transport.request_handler("item/tool/call", {"tool": "understand_video", "arguments": arguments}))
+        yield from original_events()
+
+    transport.events = events
+    result = CodexAppServerDiagnosis(transport, video_service=service).diagnose(tmp_path, bundle, attachments)
+    assert not responses[0]["success"]
+    assert responses[1]["success"] is not fails
+    assert bool(result.missing_information) is fails
+    service.understand_video.assert_called_once()
+    thread = next(p for method, p in transport.requests if method == "thread/start")
+    assert thread["dynamicTools"][0]["name"] == "understand_video"
+    assert thread["sandbox"] == "read-only"
 
 
 def test_codex_progress_summarizes_events_without_raw_payload(tmp_path: Path, bundle) -> None:

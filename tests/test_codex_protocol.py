@@ -8,6 +8,31 @@ import pytest
 from feishu_chat_diagnose.codex_protocol import StdioJsonRpcTransport
 
 
+def test_server_request_with_same_id_is_answered_before_rpc_response(stdio_transport):
+    transport = stdio_transport('''
+import json, sys
+request = json.loads(sys.stdin.readline())
+print(json.dumps({'id': request['id'], 'method': 'item/tool/call', 'params': {'tool': 'understand_video'}}), flush=True)
+reply = json.loads(sys.stdin.readline())
+assert reply['id'] == request['id'] and reply['result']['success']
+print(json.dumps({'id': request['id'], 'result': {'ack': True}}), flush=True)
+print(json.dumps({'method': 'item/tool/call', 'id': 'video-call', 'params': {'tool': 'understand_video'}}), flush=True)
+reply = json.loads(sys.stdin.readline())
+assert reply['id'] == 'video-call' and reply['result']['success']
+print(json.dumps({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}}), flush=True)
+''')
+    calls = []
+
+    def handle(method, params):
+        calls.append((method, params['tool']))
+        return {"success": True, "contentItems": []}
+
+    transport.set_request_handler(handle)
+    assert transport.request("turn/start", {}) == {"ack": True}
+    assert next(iter(transport.events()))['method'] == 'turn/completed'
+    assert calls == [('item/tool/call', 'understand_video')] * 2
+
+
 def test_stdio_transport_emits_heartbeat_during_quiet_wait(mocker) -> None:
     process = mocker.Mock()
     process.stdin = io.StringIO()

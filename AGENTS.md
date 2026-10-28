@@ -2,9 +2,10 @@
 
 ## Project Structure & Module Organization
 
-- `src/feishu_chat_diagnose/` contains the Python CLI. `cli.py` defines commands; `orchestrator.py` coordinates diagnosis; `triage.py` runs isolated discussion classification and Skill applicability assessment; `feishu.py` and `lark_runner.py` handle Feishu access; `codex_app_server.py` and `video_mcp.py` integrate diagnosis and video tools.
+- `src/feishu_chat_diagnose/` contains the Python CLI. `cli.py` defines commands; `orchestrator.py` coordinates diagnosis; `triage.py` runs isolated discussion classification and Skill applicability assessment; `feishu.py` and `lark_runner.py` handle Feishu access. `codex_app_server.py` exposes the client video tool; `video_tool.py` enforces local-first routing and caching; `video_local.py` extracts frames and runs isolated Codex perception; `video_mcp.py` provides the lazy MCP fallback.
 - `models.py`, `config.py`, `case_store.py`, and `report.py` define schemas, settings, persisted cases, and reports.
 - `codex_protocol.py` owns shared JSON-RPC transport, request/session deadlines, and strict output schemas. Keep classification isolation and diagnostic event policies in their respective callers.
+- `codex_session.py` shares the read-only session lifecycle and tool-free configuration baseline. Classification and video callers retain their effective isolation settings, event validation, and error messages.
 - `tests/` mirrors source modules; `conftest.py` provides shared fixtures and a fake Lark runner.
 - `src/feishu_chat_diagnose/config.example.toml` is the sole configuration template, bundled with the package. Runtime cases default to `~/.feishu-diagnose/cases/`; downloaded media is temporary.
 - New `analyze` runs create a case and execution log only when entering code diagnosis, after classification, validation, confirmations, and attachment preparation. Earlier failures, summary-only results, and cancellations leave no case artifacts. `init` may create the empty cases root directory.

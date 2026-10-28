@@ -78,12 +78,14 @@ def test_isolation_failure_stops_before_sending_evidence(tmp_path, message_facto
     assert not any(method in {"thread/start", "turn/start"} for method, _ in transport.requests)
 
 
-def test_unexpected_tool_event_stops_classification(tmp_path, message_factory, mocker):
+@pytest.mark.parametrize("event, message", [
+    ({"method": "item/started", "params": {"item": {"type": "commandExecution"}}}, "意外请求工具"),
+    ({"id": 1, "method": "item/tool/call", "params": {}}, "分类执行失败"),
+])
+def test_unexpected_tool_event_stops_classification(tmp_path, message_factory, mocker, event, message):
     transport = ClassifierTransport({"topics": [topic()]})
-    mocker.patch.object(transport, "events", return_value=iter([
-        {"method": "item/started", "params": {"item": {"type": "commandExecution"}}},
-    ]))
-    with pytest.raises(TriageError, match="意外请求工具"):
+    mocker.patch.object(transport, "events", return_value=iter([event]))
+    with pytest.raises(TriageError, match=message):
         CodexDiscussionClassifier(transport, tmp_path).classify("editor", "", [message_factory("message", "Hi")])
 
 

@@ -23,7 +23,7 @@ lark_cli_bin = "lark-cli"
 
 [codex]
 bin = "codex"
-# 前置分类、Skill 适用性评估和代码诊断共用此模型；留空使用 Codex 默认模型。
+# 前置分类、Skill 评估、本地视频画面理解和代码诊断共用此模型；留空使用默认模型。
 model = ""
 # 单次 RPC 请求的总等待上限，以及事件流等待下一条完整消息的上限。
 timeout_seconds = 600
@@ -31,7 +31,20 @@ timeout_seconds = 600
 # 分类、Skill 评估、代码诊断分别计时；显式 resume 使用新会话。
 total_timeout_seconds = 1800
 
+[video_local]
+# 本地优先：CLI 抽帧后交给隔离的 Codex 图片理解会话，不通过 MCP。
+ffmpeg_bin = "ffmpeg"
+ffprobe_bin = "ffprobe"
+# 短视频约每秒一帧；长视频均匀覆盖，最多 24 帧，不理解音轨。
+max_frames = 24
+max_dimension = 1280
+max_image_bytes = 16777216
+decode_timeout_seconds = 30
+# 抽帧与 Codex 理解的总时限；也受 Codex 和当前诊断的剩余总时限约束。
+timeout_seconds = 120
+
 [video_tool]
+# 仅在本地解析失败后启用的 MCP 回退；本地成功时不要求配置凭据。
 provider = "dashscope"
 # 使用已开通且支持视频理解的模型。
 model = "qwen3-vl-plus"

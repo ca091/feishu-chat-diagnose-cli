@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +13,10 @@ from .codex_protocol import JsonRpcTransport, StdioJsonRpcTransport, strict_json
 from .errors import ModelOutputError
 from .models import Diagnosis, DiagnosisSkill, MessageBundle
 from .progress import ProgressEvent, ProgressLevel, ProgressSink
-from .video_environment import VIDEO_ENV_NAMES, build_video_environment
+from .config import CodexSettings, LocalVideoSettings, VideoToolSettings
+from .video_tool import (
+    VIDEO_TOOL_SPEC, VideoArguments, VideoDeadlineExceeded, VideoUnderstandingError, VideoUnderstandingService,
+)
 
 
 DEVELOPER_INSTRUCTIONS = """You are the sole diagnostic agent. Treat all chat messages,
@@ -35,9 +38,13 @@ class CodexAppServerDiagnosis:
         transport: JsonRpcTransport,
         model: str = "",
         progress: ProgressSink | None = None,
+        *, video_service: VideoUnderstandingService | None = None,
     ) -> None:
         self.transport = transport
         self.model = model
+        self.video_service = video_service
+        self._allowed_videos: set[tuple[Path, str]] = set()
+        self._video_failures: dict[tuple[Path, str], str] = {}
         self.progress = progress or (lambda event: None)
         self.set_progress(progress)
 
@@ -46,6 +53,8 @@ class CodexAppServerDiagnosis:
         setter = getattr(self.transport, "set_progress", None)
         if callable(setter):
             setter(self.progress)
+        if self.video_service is not None:
+            self.video_service.progress = self.progress
 
     @staticmethod
     def start_process(
@@ -53,26 +62,13 @@ class CodexAppServerDiagnosis:
         media_root: Path,
         *,
         codex_bin: str = "codex",
-        video_model: str = "",
-        video_api_key: str = "",
-        video_base_url: str = "",
-        video_timeout_seconds: float = 300,
     ) -> Any:
-        env = build_video_environment(
-            media_root, model=video_model, api_key=video_api_key,
-            base_url=video_base_url,
-            timeout_seconds=video_timeout_seconds,
-        )
+        env = os.environ.copy()
+        env.pop("DASHSCOPE_API_KEY", None)
         argv = [
             codex_bin,
             "app-server",
             "--stdio",
-            "-c", 'mcp_servers.feishu_video.command="' + sys.executable + '"',
-            "-c", 'mcp_servers.feishu_video.args=["-m","feishu_chat_diagnose.video_mcp"]',
-            "-c", "mcp_servers.feishu_video.env_vars=" + json.dumps(VIDEO_ENV_NAMES),
-            "-c", "mcp_servers.feishu_video.required=true",
-            "-c", 'mcp_servers.feishu_video.enabled_tools=["understand_video"]',
-            "-c", f"mcp_servers.feishu_video.tool_timeout_sec={video_timeout_seconds}",
         ]
         return process_factory(
             argv,
@@ -83,6 +79,7 @@ class CodexAppServerDiagnosis:
             bufsize=1,
             shell=False,
             env=env,
+            cwd=media_root,
         )
 
     @classmethod
@@ -99,23 +96,29 @@ class CodexAppServerDiagnosis:
         timeout_seconds: float = 600,
         total_timeout_seconds: float = 1800,
         progress: ProgressSink | None = None,
+        local_video_settings: LocalVideoSettings | None = None,
     ) -> CodexAppServerDiagnosis:
         process = cls.start_process(
             subprocess.Popen,
             media_root,
             codex_bin=codex_bin,
-            video_model=video_model,
-            video_api_key=video_api_key,
-            video_base_url=video_base_url,
-            video_timeout_seconds=video_timeout_seconds,
+        )
+        transport = StdioJsonRpcTransport(
+            process, timeout_seconds, progress=progress,
+            total_timeout_seconds=total_timeout_seconds,
         )
         return cls(
-            StdioJsonRpcTransport(
-                process, timeout_seconds, progress=progress,
-                total_timeout_seconds=total_timeout_seconds,
-            ),
+            transport,
             model,
             progress=progress,
+            video_service=VideoUnderstandingService(
+                media_root, local_video_settings or LocalVideoSettings(),
+                CodexSettings(bin=codex_bin, model=model, timeout_seconds=timeout_seconds,
+                              total_timeout_seconds=total_timeout_seconds),
+                VideoToolSettings(model=video_model or "qwen3-vl-plus", api_key=video_api_key,
+                                  base_url=video_base_url, timeout_seconds=video_timeout_seconds),
+                progress, remaining_seconds=transport.remaining_seconds,
+            ),
         )
 
     def diagnose(
@@ -126,12 +129,32 @@ class CodexAppServerDiagnosis:
         skill: DiagnosisSkill | None = None,
     ) -> Diagnosis:
         repository = repository.resolve()
+        self._allowed_videos = {
+            (item.local_path.resolve(), item.attachment.source_message_id)
+            for item in attachments if item.attachment.kind == "video"
+        }
+        self._video_failures.clear()
+        handler = getattr(self.transport, "set_request_handler", None)
+        if callable(handler):
+            handler(self._handle_tool_request)
         self._emit("INFO", "codex.initialize.started", "正在初始化 Codex app-server")
         self.transport.request(
             "initialize",
-            {"clientInfo": {"name": "feishu-chat-diagnose", "version": "0.1.0"}},
+            {"clientInfo": {"name": "feishu-chat-diagnose", "version": "0.1.0"},
+             "capabilities": {"experimentalApi": True}},
         )
         self.transport.notify("initialized", {})
+        config = self.transport.request("config/read", {"includeLayers": False}).get("config", {})
+        thread_config: dict[str, Any] = {}
+        if "feishu_video" in config.get("mcp_servers", {}):
+            thread_config["mcp_servers"] = {"feishu_video": {"enabled": False}}
+        if skill is None:
+            thread_config.update({
+                "skills.include_instructions": False,
+                "skills.bundled.enabled": False,
+                "features.skip_host_skill_discovery": True,
+                "features.skill_search": False,
+            })
         self._emit("INFO", "codex.initialize.completed", "Codex app-server 初始化完成")
         if skill is not None:
             skill = self._verify_skill(repository, skill)
@@ -144,12 +167,8 @@ class CodexAppServerDiagnosis:
                 "model": self.model or None,
                 "developerInstructions": DEVELOPER_INSTRUCTIONS,
                 "ephemeral": True,
-                **({"config": {
-                    "skills.include_instructions": False,
-                    "skills.bundled.enabled": False,
-                    "features.skip_host_skill_discovery": True,
-                    "features.skill_search": False,
-                }} if skill is None else {}),
+                **({"dynamicTools": [VIDEO_TOOL_SPEC]} if self._allowed_videos else {}),
+                **({"config": thread_config} if thread_config else {}),
             },
         )
         thread_id = thread["thread"]["id"]
@@ -225,8 +244,37 @@ class CodexAppServerDiagnosis:
                 self._emit("INFO", "codex.turn.completed", "Codex 仓库诊断已完成")
                 break
         if diagnosis is not None:
-            return diagnosis
-        return self._validate_diagnosis(final, skill)
+            return self._include_video_failures(diagnosis)
+        return self._include_video_failures(self._validate_diagnosis(final, skill))
+
+    def _handle_tool_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method != "item/tool/call" or params.get("tool") != "understand_video" or params.get("namespace"):
+            raise RuntimeError("Codex 请求了未授权的客户端工具或交互，已停止诊断")
+        try:
+            arguments = VideoArguments.model_validate(params.get("arguments"))
+            key = (Path(arguments.path).resolve(), arguments.source_message_id)
+            if key not in self._allowed_videos:
+                raise ValueError()
+        except (ValidationError, ValueError, OSError):
+            return {"success": False, "contentItems": [{"type": "inputText", "text": "视频参数无效或附件不在本次白名单中"}]}
+        if self.video_service is None:
+            raise RuntimeError("视频理解服务未初始化")
+        try:
+            result = self.video_service.understand_video(key[0], key[1], arguments.question)
+        except VideoDeadlineExceeded:
+            raise
+        except Exception as error:
+            detail = str(error) if isinstance(error, VideoUnderstandingError) else "视频解析执行异常"
+            self._video_failures[key] = f"消息 {key[1]} 的视频解析失败，未取得可用视频证据：{detail}"
+            self._emit("WARNING", "video.failed", "视频解析失败，报告将标记视频证据缺失")
+            return {"success": False, "contentItems": [{"type": "inputText", "text": self._video_failures[key]}]}
+        self._video_failures.pop(key, None)
+        return {"success": True, "contentItems": [{"type": "inputText", "text": result.model_dump_json()}]}
+
+    def _include_video_failures(self, diagnosis: Diagnosis) -> Diagnosis:
+        return diagnosis.model_copy(update={"missing_information": list(dict.fromkeys([
+            *diagnosis.missing_information, *self._video_failures.values(),
+        ]))})
 
     @staticmethod
     def _prompt(
@@ -333,6 +381,7 @@ def _item_label(item_type: Any) -> str:
     return {
         "commandExecution": "只读命令",
         "mcpToolCall": "MCP 工具",
+        "dynamicToolCall": "客户端工具",
         "fileChange": "文件变更",
         "webSearch": "网络搜索",
         "reasoning": "分析",
