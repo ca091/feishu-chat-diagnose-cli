@@ -146,6 +146,110 @@ def test_parse_current_lark_cli_shape_extracts_text_and_inline_image() -> None:
     assert message.attachments[0].kind == "image"
 
 
+def test_forwarded_attachments_reach_download_and_diagnosis(
+    fake_runner, time_range, tmp_path, mocker,
+) -> None:
+    import json
+
+    from feishu_chat_diagnose.attachments import AttachmentManager
+    from feishu_chat_diagnose.codex_app_server import CodexAppServerDiagnosis
+    from feishu_chat_diagnose.models import ConversationIdentity, MessageBundle
+
+    content = (
+        '<forwarded_messages>\n[2026-07-15T14:00:00+08:00] Sender:\n'
+        '导出失败\n![Image](img_forward)\n'
+        '<forwarded_messages>\n'
+        '<video key="file_video" name="录屏.MOV" duration="5s" cover_image_key="img_cover"/>\n'
+        '<file name="错误 &amp; &quot;日志&quot;.log" key="file_log"/>\n'
+        '</forwarded_messages>\n</forwarded_messages>'
+    )
+    raw = _raw_message("om_forward", "", "1752559200000")
+    raw.update(content=content, msg_type="merge_forward")
+    fake_runner.responses.append({"items": [raw], "has_more": False})
+    gateway = FeishuGateway(fake_runner)
+
+    messages = gateway.fetch_messages("oc_group_a", time_range).messages
+
+    assert messages[0].text == content
+    assert [(a.file_key, a.kind) for a in messages[0].attachments] == [
+        ("img_forward", "image"), ("file_video", "video"), ("file_log", "text"),
+    ]
+    assert len(fake_runner.calls) == 1
+    assert "--download-resources" not in fake_runner.calls[0]
+
+    def download(args, cwd):
+        assert args[:2] == ["im", "+messages-resources-download"]
+        assert args[args.index("--message-id") + 1] == "om_forward"
+        key = args[args.index("--file-key") + 1]
+        assert args[args.index("--type") + 1] == ("image" if key == "img_forward" else "file")
+        path = cwd / args[args.index("--output") + 1]
+        path.write_bytes("导出失败：processing".encode() if key == "file_log" else b"media")
+        return {}
+
+    mocker.patch.object(fake_runner, "run", side_effect=download)
+    bundle = MessageBundle(
+        conversation=ConversationIdentity(chat_id="oc_group_a", name="Project", conversation_type="group"),
+        time_range=time_range, messages=messages,
+    )
+    with AttachmentManager(gateway, tmp_path, 1024).materialize(messages[0].attachments) as batch:
+        assert not batch.failed
+        paths = [item.local_path for item in batch.available]
+        assert [path.suffix for path in paths] == [".png", ".mov", ".log"]
+        assert batch.available[2].attachment.name == '错误 & "日志".log'
+        prompt = CodexAppServerDiagnosis._prompt(bundle, batch.available, None)
+        text_inputs = json.loads(
+            prompt.split("TEXT_ATTACHMENTS_JSON:\n", 1)[1].split("\n\nVIDEO_TOOL_MAPPINGS_JSON:", 1)[0]
+        )
+        videos = json.loads(prompt.split("VIDEO_TOOL_MAPPINGS_JSON:\n", 1)[1])
+        assert text_inputs == [{
+            "source_message_id": "om_forward", "name": '错误 & "日志".log',
+            "content": "导出失败：processing",
+        }]
+        assert videos == [{
+            "source_message_id": "om_forward", "name": "录屏.MOV", "path": str(paths[1]),
+        }]
+    assert all(not path.exists() for path in paths)
+
+
+def test_inline_attachments_are_deduplicated_and_resources_take_precedence() -> None:
+    raw = _raw_message("om_1", "", "1752559200000")
+    raw["content"] = (
+        '<video key="file_video" name="fallback.mp4"/>'
+        '<video key="file_video" name="fallback.mp4"/>'
+        '<file key="file_text" name="console.txt"/>'
+        '<file key="file_text" name="console.txt"/>'
+        '![Image](img_one) ![Image](img_one)'
+    )
+    raw["resources"] = [{
+        "file_key": "file_video", "content_type": "video/webm", "name": "original.webm",
+    }]
+
+    message = parse_message(raw)
+
+    assert {a.file_key for a in message.attachments} == {"file_video", "file_text", "img_one"}
+    assert len(message.attachments) == 3
+    assert message.attachments[0].name == "original.webm"
+    assert message.attachments[0].media_type == "video/webm"
+
+
+def test_inline_video_without_filename_and_unsupported_files() -> None:
+    from feishu_chat_diagnose.attachments import _safe_suffix
+
+    raw = _raw_message("om_1", "", "1752559200000")
+    raw["content"] = (
+        '<video key="file_video" name="file_video"/>'
+        '<file key="file_document" name="需求.pdf"/>'
+        '<video name="missing-key.mp4"/> <file key=""/> <file key="   "/>'
+    )
+
+    message = parse_message(raw)
+
+    assert [(a.file_key, a.kind) for a in message.attachments] == [
+        ("file_video", "video"), ("file_document", "unsupported"),
+    ]
+    assert _safe_suffix(message.attachments[0]) == ".mp4"
+
+
 def test_fetch_messages_follows_nested_data_pagination(fake_runner, time_range) -> None:
     first = _raw_message("om_first", "first", "1752559200000")
     second = _raw_message("om_second", "second", "1752559260000")

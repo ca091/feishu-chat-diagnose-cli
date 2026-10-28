@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -256,19 +257,10 @@ def parse_message(raw: dict[str, Any]) -> NormalizedMessage:
     resources = [item for item in raw.get("resources", []) if isinstance(item, dict)]
     attachments = [_parse_attachment(message_id, item) for item in resources]
     known_keys = {item.file_key for item in attachments}
-    for index, key in enumerate(_inline_image_keys(content), start=1):
-        if key not in known_keys:
-            attachments.append(
-                AttachmentRef(
-                    source_message_id=message_id,
-                    file_key=key,
-                    resource_type="image",
-                    media_type="image/*",
-                    name=f"inline-image-{index}.png",
-                    kind="image",
-                )
-            )
-            known_keys.add(key)
+    for attachment in _inline_attachments(message_id, content):
+        if attachment.file_key not in known_keys:
+            attachments.append(attachment)
+            known_keys.add(attachment.file_key)
     position = raw.get("message_position")
     return NormalizedMessage(
         message_id=message_id,
@@ -339,9 +331,45 @@ def _text_fragments(value: Any) -> list[str]:
     return result
 
 
-def _inline_image_keys(content: Any) -> list[str]:
+def _inline_attachments(message_id: str, content: Any) -> list[AttachmentRef]:
     text = "\n".join(_text_fragments(content))
-    return re.findall(r"!\[Image\]\((img_[^)\s]+)\)", text, flags=re.IGNORECASE)
+    images = re.findall(r"!\[Image\]\((img_[^)\s]+)\)", text, flags=re.IGNORECASE)
+    attachments = [
+        AttachmentRef(
+            source_message_id=message_id, file_key=key, resource_type="image",
+            media_type="image/*", name=f"inline-image-{index}.png", kind="image",
+        )
+        for index, key in enumerate(images, start=1)
+    ]
+    parser = _InlineFileParser(message_id)
+    parser.feed(text)
+    parser.close()
+    return attachments + parser.attachments
+
+
+class _InlineFileParser(HTMLParser):
+    """Read lark-cli file/video markers, including nested forwarded messages."""
+
+    def __init__(self, message_id: str) -> None:
+        super().__init__()
+        self.message_id = message_id
+        self.attachments: list[AttachmentRef] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in {"file", "video"}:
+            return
+        values = dict(attrs)
+        key = (values.get("key") or "").strip()
+        if not key:
+            return
+        name = values.get("name") or key
+        media_type = ""
+        if tag == "video":
+            # Markers omit MIME; preserve known video suffixes and fall back to MP4.
+            media_type = VIDEO_MIME_TYPES.get(Path(name).suffix.lower(), "video/mp4")
+        self.attachments.append(_parse_attachment(self.message_id, {
+            "file_key": key, "name": name, "content_type": media_type,
+        }))
 
 
 def _parse_attachment(message_id: str, raw: dict[str, Any]) -> AttachmentRef:
